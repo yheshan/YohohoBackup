@@ -1,6 +1,6 @@
 #!/bin/bash
-# 功能：iptables/nftables 规则管理（完美显示 + 极简操作）
-# 特点：规则显示完整、nftables直接显示IP:端口、一键清空
+# 功能：iptables/nftables 规则管理，支持极简删除（输入编号即可）
+# 特点：nftables 删除无需输入IP/端口、规则高亮显示、一键清空
 
 # 颜色定义
 RED='\033[0;31m'
@@ -85,44 +85,28 @@ EOF
     echo -e "${GREEN}nftables 规则已添加: ${LOCAL_IP}:${LOCAL_PORT} -> ${TARGET_IP}:${TARGET_PORT} (TCP+UDP)${NC}"
 }
 
-#--------------------- 规则查看 ---------------------
-# 查看 iptables 规则（终极修复版）
-show_iptables_rules() {
-    echo -e "\n${BLUE}=== iptables 规则 ===${NC}"
-    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT" | awk '{
-        split($12, parts, ":");
-        printf "  %s %s %s -> %s:%s\n", $1, $7, $11, parts[1], parts[2]
-    }'
-}
+#--------------------- 规则管理 ---------------------
+# 查看规则（自动编号 + 高亮）
+show_rules() {
+    echo -e "\n${YELLOW}=== 当前转发规则 ===${NC}"
+    
+    # iptables 规则（带编号）
+    echo -e "${BLUE}[iptables]${NC}"
+    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:" | awk '{printf "  %s %s %s -> %s\n", $1, $7, $11, $12}'
 
-# 查看 nftables 规则（直接显示IP:端口）
-show_nftables_rules() {
-    echo -e "\n${BLUE}=== nftables 规则 ===${NC}"
+    # nftables 规则（带编号）
+    echo -e "\n${BLUE}[nftables]${NC}"
     nft list table ip nat 2>/dev/null | grep -A2 "dnat to" | awk '{
         if ($0 ~ /tcp|udp/) { proto=$1 }
         if ($0 ~ /dport/) { port=$2 }
-        if ($0 ~ /dnat to/) { split($3, target, ":"); ip=target[1]; port_dst=target[2] }
-        if (proto && port && ip && port_dst) {
-            printf "  %s %s -> %s:%s\n", proto, port, ip, port_dst
+        if ($0 ~ /dnat to/) { target=$3 }
+        if (proto && port && target) {
+            printf "  %s %s %s -> %s\n", NR, proto, port, target;
+            proto=port=target=""
         }
     }'
 }
 
-# 选择查看规则类型
-show_rules() {
-    echo -e "\n${YELLOW}=== 查看规则 ===${NC}"
-    echo "1) iptables 规则"
-    echo "2) nftables 规则"
-    read -p "请选择 [1-2]: " CHOICE
-
-    case $CHOICE in
-        1) show_iptables_rules ;;
-        2) show_nftables_rules ;;
-        *) echo -e "${RED}无效选择！${NC}" ;;
-    esac
-}
-
-#--------------------- 规则管理 ---------------------
 # 删除单条规则（极简版）
 delete_single_rule() {
     echo -e "\n${YELLOW}=== 删除单条规则 ===${NC}"
@@ -132,17 +116,32 @@ delete_single_rule() {
 
     case $CHOICE in
         1)
-            show_iptables_rules
+            echo -e "\n${BLUE}[iptables 规则列表]${NC}"
+            iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:"
             read -p "输入要删除的规则编号: " NUM
             iptables -t nat -D PREROUTING "$NUM"
             iptables_save
             ;;
         2)
-            show_nftables_rules
-            read -p "输入要删除的规则行号: " NUM
-            HANDLE=$(nft -a list chain ip nat prerouting | awk -v line=$((NUM*3-1)) 'NR==line{print $NF}')
-            nft delete rule ip nat prerouting handle $HANDLE
-            nftables_save
+            echo -e "\n${BLUE}[nftables 规则列表]${NC}"
+            RULES=($(nft list table ip nat 2>/dev/null | grep -n "dnat to" | cut -d: -f1))
+            nft list table ip nat | grep -A2 "dnat to" | awk '{
+                if ($0 ~ /tcp|udp/) { proto=$1 }
+                if ($0 ~ /dport/) { port=$2 }
+                if ($0 ~ /dnat to/) { target=$3 }
+                if (proto && port && target) {
+                    printf "  %s %s %s -> %s\n", NR, proto, port, target;
+                    proto=port=target=""
+                }
+            }'
+            read -p "输入要删除的规则编号: " NUM
+            if [ -n "${RULES[$NUM]}" ]; then
+                LINE_NUM=${RULES[$NUM]}
+                nft delete rule ip nat prerouting handle $(nft -a list table ip nat | awk -v line=$LINE_NUM 'NR==line{print $NF}')
+                nftables_save
+            else
+                echo -e "${RED}无效编号！${NC}"
+            fi
             ;;
         *) echo -e "${RED}无效选择！${NC}" ;;
     esac
@@ -172,7 +171,7 @@ main_menu() {
     echo -e "\n${YELLOW}==== 流量转发管理 ====${NC}"
     echo "1) iptables 转发 (TCP+UDP)"
     echo "2) nftables 转发 (TCP+UDP)"
-    echo "3) 查看规则"
+    echo "3) 查看所有规则"
     echo "4) 删除单条规则"
     echo "5) 清除所有规则"
     echo -e "${RED}q) 退出${NC}"
@@ -192,7 +191,7 @@ main_menu() {
 # 初始化
 check_root
 install_deps
-LOCAL_IP=$(hostname -I | awk '{print $1}')
+LOCAL_IP=$(get_local_ip)
 while true; do
     main_menu
 done
