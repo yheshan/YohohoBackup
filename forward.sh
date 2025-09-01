@@ -1,6 +1,6 @@
 #!/bin/bash
-# 功能：iptables/nftables 规则管理（修复显示问题 + 分类型查看）
-# 特点：规则显示完整、删除极简、一键清空
+# 功能：iptables/nftables 规则管理（完美显示 + 极简操作）
+# 特点：规则显示完整、nftables直接显示IP:端口、一键清空
 
 # 颜色定义
 RED='\033[0;31m'
@@ -86,23 +86,24 @@ EOF
 }
 
 #--------------------- 规则查看 ---------------------
-# 查看 iptables 规则（修复版）
+# 查看 iptables 规则（终极修复版）
 show_iptables_rules() {
     echo -e "\n${BLUE}=== iptables 规则 ===${NC}"
     iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT" | awk '{
-        printf "  %s %s %s -> %s:%s\n", $1, $7, $11, $12, $13
+        split($12, parts, ":");
+        printf "  %s %s %s -> %s:%s\n", $1, $7, $11, parts[1], parts[2]
     }'
 }
 
-# 查看 nftables 规则
+# 查看 nftables 规则（直接显示IP:端口）
 show_nftables_rules() {
     echo -e "\n${BLUE}=== nftables 规则 ===${NC}"
     nft list table ip nat 2>/dev/null | grep -A2 "dnat to" | awk '{
         if ($0 ~ /tcp|udp/) { proto=$1 }
         if ($0 ~ /dport/) { port=$2 }
-        if ($0 ~ /dnat to/) { target=$3 }
-        if (proto && port && target) {
-            printf "  %s %s -> %s\n", proto, port, target
+        if ($0 ~ /dnat to/) { split($3, target, ":"); ip=target[1]; port_dst=target[2] }
+        if (proto && port && ip && port_dst) {
+            printf "  %s %s -> %s:%s\n", proto, port, ip, port_dst
         }
     }'
 }
@@ -138,8 +139,8 @@ delete_single_rule() {
             ;;
         2)
             show_nftables_rules
-            read -p "输入要删除的规则编号（行号）: " NUM
-            HANDLE=$(nft -a list chain ip nat prerouting | awk -v line=$NUM 'NR==line{print $NF}')
+            read -p "输入要删除的规则行号: " NUM
+            HANDLE=$(nft -a list chain ip nat prerouting | awk -v line=$((NUM*3-1)) 'NR==line{print $NF}')
             nft delete rule ip nat prerouting handle $HANDLE
             nftables_save
             ;;
@@ -191,7 +192,7 @@ main_menu() {
 # 初始化
 check_root
 install_deps
-LOCAL_IP=$(get_local_ip)
+LOCAL_IP=$(hostname -I | awk '{print $1}')
 while true; do
     main_menu
 done
