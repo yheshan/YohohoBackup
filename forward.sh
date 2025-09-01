@@ -1,6 +1,6 @@
 #!/bin/bash
-# 功能：iptables/nftables 规则管理，支持逐条删除和一键清空
-# 特点：精准删除、双协议支持、持久化
+# 功能：iptables/nftables 规则管理，支持极简删除（输入编号即可）
+# 特点：nftables 删除无需输入IP/端口、规则高亮显示、一键清空
 
 # 颜色定义
 RED='\033[0;31m'
@@ -86,28 +86,28 @@ EOF
 }
 
 #--------------------- 规则管理 ---------------------
-# 查看规则（高亮关键信息）
+# 查看规则（自动编号 + 高亮）
 show_rules() {
     echo -e "\n${YELLOW}=== 当前转发规则 ===${NC}"
     
-    # iptables 规则
+    # iptables 规则（带编号）
     echo -e "${BLUE}[iptables]${NC}"
-    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:" | while read -r line; do
-        if [[ $line =~ dpt:([0-9]+).*to:([0-9.]+):([0-9]+) ]]; then
-            echo -e "  ${GREEN}规则 ${BASH_REMATCH[1]}: 本地端口 ${BASH_REMATCH[2]} -> ${BASH_REMATCH[3]}:${BASH_REMATCH[4]}${NC}"
-        fi
-    done
+    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:" | awk '{printf "  %s %s %s -> %s\n", $1, $7, $11, $12}'
 
-    # nftables 规则
+    # nftables 规则（带编号）
     echo -e "\n${BLUE}[nftables]${NC}"
-    nft list ruleset | grep -A2 "dnat to" | while read -r line; do
-        if [[ $line =~ dport[[:space:]]+([0-9]+).*dnat[[:space:]]to[[:space:]]([0-9.]+):([0-9]+) ]]; then
-            echo -e "  ${GREEN}规则: 本地端口 ${BASH_REMATCH[1]} -> ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}${NC}"
-        fi
-    done
+    nft list table ip nat 2>/dev/null | grep -A2 "dnat to" | awk '{
+        if ($0 ~ /tcp|udp/) { proto=$1 }
+        if ($0 ~ /dport/) { port=$2 }
+        if ($0 ~ /dnat to/) { target=$3 }
+        if (proto && port && target) {
+            printf "  %s %s %s -> %s\n", NR, proto, port, target;
+            proto=port=target=""
+        }
+    }'
 }
 
-# 删除单条规则
+# 删除单条规则（极简版）
 delete_single_rule() {
     echo -e "\n${YELLOW}=== 删除单条规则 ===${NC}"
     echo "1) iptables"
@@ -124,12 +124,24 @@ delete_single_rule() {
             ;;
         2)
             echo -e "\n${BLUE}[nftables 规则列表]${NC}"
-            nft list ruleset | grep -A2 "dnat to"
-            read -p "输入要删除的规则目标IP: " TARGET_IP
-            read -p "输入要删除的规则目标端口: " TARGET_PORT
-            nft delete rule ip nat prerouting ip daddr "$TARGET_IP" tcp dport "$TARGET_PORT"
-            nft delete rule ip nat prerouting ip daddr "$TARGET_IP" udp dport "$TARGET_PORT"
-            nftables_save
+            RULES=($(nft list table ip nat 2>/dev/null | grep -n "dnat to" | cut -d: -f1))
+            nft list table ip nat | grep -A2 "dnat to" | awk '{
+                if ($0 ~ /tcp|udp/) { proto=$1 }
+                if ($0 ~ /dport/) { port=$2 }
+                if ($0 ~ /dnat to/) { target=$3 }
+                if (proto && port && target) {
+                    printf "  %s %s %s -> %s\n", NR, proto, port, target;
+                    proto=port=target=""
+                }
+            }'
+            read -p "输入要删除的规则编号: " NUM
+            if [ -n "${RULES[$NUM]}" ]; then
+                LINE_NUM=${RULES[$NUM]}
+                nft delete rule ip nat prerouting handle $(nft -a list table ip nat | awk -v line=$LINE_NUM 'NR==line{print $NF}')
+                nftables_save
+            else
+                echo -e "${RED}无效编号！${NC}"
+            fi
             ;;
         *) echo -e "${RED}无效选择！${NC}" ;;
     esac
