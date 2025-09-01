@@ -1,11 +1,12 @@
 #!/bin/bash
-# 功能：iptables/nftables 转发，支持 TCP/UDP 合并查看和精准删除
-# 特点：规则合并显示、逐条删除、一键清空、持久化
+# 功能：iptables/nftables 规则管理，支持逐条删除和一键清空
+# 特点：精准删除、双协议支持、持久化
 
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 # 检查 root
@@ -24,32 +25,18 @@ install_deps() {
     fi
 }
 
-# 获取本机IP
-get_local_ip() {
-    LOCAL_IP=$(ip route get 1 | awk '{print $7}' | head -1)
-    [ -z "$LOCAL_IP" ] && LOCAL_IP="0.0.0.0"
-    echo "$LOCAL_IP"
-}
-
 # 持久化 iptables 规则
 iptables_save() {
     if grep -qi "alpine" /etc/os-release; then
         iptables-save > /etc/iptables.rules
-        echo "iptables-restore < /etc/iptables.rules" >> /etc/local.d/iptables.start
-        chmod +x /etc/local.d/iptables.start
-        rc-update add local >/dev/null
     else
         iptables-save | tee /etc/iptables/rules.v4 >/dev/null
-        systemctl enable netfilter-persistent >/dev/null
     fi
 }
 
 # 持久化 nftables 规则
 nftables_save() {
-    if [ -f /etc/nftables.conf ]; then
-        nft list ruleset > /etc/nftables.conf
-        systemctl enable nftables >/dev/null 2>&1 || true
-    fi
+    nft list ruleset > /etc/nftables.conf 2>/dev/null || true
 }
 
 #--------------------- 核心转发函数 ---------------------
@@ -68,7 +55,7 @@ iptables_forward() {
     iptables -t nat -A POSTROUTING -j MASQUERADE
 
     iptables_save
-    echo -e "${GREEN}iptables 规则已添加: ${LOCAL_IP}:${LOCAL_PORT} (TCP+UDP) -> ${TARGET_IP}:${TARGET_PORT}${NC}"
+    echo -e "${GREEN}iptables 规则已添加: ${LOCAL_IP}:${LOCAL_PORT} -> ${TARGET_IP}:${TARGET_PORT} (TCP+UDP)${NC}"
 }
 
 # 2. nftables 转发（TCP+UDP）
@@ -95,54 +82,76 @@ table ip nat {
 EOF
     nft -f /etc/nftables.conf
     nftables_save
-    echo -e "${GREEN}nftables 规则已添加: ${LOCAL_IP}:${LOCAL_PORT} (TCP+UDP) -> ${TARGET_IP}:${TARGET_PORT}${NC}"
+    echo -e "${GREEN}nftables 规则已添加: ${LOCAL_IP}:${LOCAL_PORT} -> ${TARGET_IP}:${TARGET_PORT} (TCP+UDP)${NC}"
 }
 
 #--------------------- 规则管理 ---------------------
-# 查看规则（合并TCP/UDP显示）
+# 查看规则（高亮关键信息）
 show_rules() {
     echo -e "\n${YELLOW}=== 当前转发规则 ===${NC}"
     
-    # iptables 规则合并显示
-    echo -e "${GREEN}[iptables]${NC}"
-    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:" | awk '{printf "%-6s %-10s %-20s -> %s\n", $1, $7, $11, $NF}' | uniq
-    
-    # nftables 规则合并显示
-    echo -e "\n${GREEN}[nftables]${NC}"
-    nft list table ip nat 2>/dev/null | grep -E "tcp|udp" | awk '/dport/ {port=$NF} /dnat/ {print port, $NF}' | uniq
+    # iptables 规则
+    echo -e "${BLUE}[iptables]${NC}"
+    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:" | while read -r line; do
+        if [[ $line =~ dpt:([0-9]+).*to:([0-9.]+):([0-9]+) ]]; then
+            echo -e "  ${GREEN}规则 ${BASH_REMATCH[1]}: 本地端口 ${BASH_REMATCH[2]} -> ${BASH_REMATCH[3]}:${BASH_REMATCH[4]}${NC}"
+        fi
+    done
+
+    # nftables 规则
+    echo -e "\n${BLUE}[nftables]${NC}"
+    nft list ruleset | grep -A2 "dnat to" | while read -r line; do
+        if [[ $line =~ dport[[:space:]]+([0-9]+).*dnat[[:space:]]to[[:space:]]([0-9.]+):([0-9]+) ]]; then
+            echo -e "  ${GREEN}规则: 本地端口 ${BASH_REMATCH[1]} -> ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}${NC}"
+        fi
+    done
 }
 
-# 删除规则（支持逐条或清空）
-delete_rules() {
-    echo -e "\n${YELLOW}=== 删除规则 ===${NC}"
-    echo "1) 删除 iptables 规则"
-    echo "2) 删除 nftables 规则"
-    echo "3) 一键清空所有规则"
-    read -p "选择操作 [1-3]: " CHOICE
+# 删除单条规则
+delete_single_rule() {
+    echo -e "\n${YELLOW}=== 删除单条规则 ===${NC}"
+    echo "1) iptables"
+    echo "2) nftables"
+    read -p "选择类型 [1-2]: " CHOICE
 
     case $CHOICE in
         1)
-            echo -e "\n${YELLOW}=== iptables 规则列表 ===${NC}"
+            echo -e "\n${BLUE}[iptables 规则列表]${NC}"
             iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:"
-            read -p "输入要删除的规则编号（留空取消）: " NUM
-            [ -n "$NUM" ] && iptables -t nat -D PREROUTING "$NUM" && iptables_save
+            read -p "输入要删除的规则编号: " NUM
+            iptables -t nat -D PREROUTING "$NUM"
+            iptables_save
             ;;
         2)
-            echo -e "\n${YELLOW}=== nftables 规则列表 ===${NC}"
-            nft list table ip nat 2>/dev/null | grep -E "tcp|udp" -A2 | awk '/dport/ {port=$NF} /dnat/ {print NR, port, $NF}'
-            read -p "输入要删除的规则行号（留空取消）: " NUM
-            if [ -n "$NUM" ]; then
-                LINE=$(nft list table ip nat 2>/dev/null | grep -nE "tcp|udp" | awk -F: -v num="$NUM" 'NR==num {print $1}')
-                [ -n "$LINE" ] && sed -i "${LINE},$((LINE+2))d" /etc/nftables.conf && nft -f /etc/nftables.conf
-            fi
-            ;;
-        3)
-            iptables -t nat -F && iptables -t nat -X
-            nft flush ruleset && rm -f /etc/nftables.conf
-            echo -e "${GREEN}所有规则已清空！${NC}"
+            echo -e "\n${BLUE}[nftables 规则列表]${NC}"
+            nft list ruleset | grep -A2 "dnat to"
+            read -p "输入要删除的规则目标IP: " TARGET_IP
+            read -p "输入要删除的规则目标端口: " TARGET_PORT
+            nft delete rule ip nat prerouting ip daddr "$TARGET_IP" tcp dport "$TARGET_PORT"
+            nft delete rule ip nat prerouting ip daddr "$TARGET_IP" udp dport "$TARGET_PORT"
+            nftables_save
             ;;
         *) echo -e "${RED}无效选择！${NC}" ;;
     esac
+    echo -e "${GREEN}规则已删除！${NC}"
+}
+
+# 清除所有规则
+flush_all_rules() {
+    echo -e "\n${RED}=== 警告：即将清除所有转发规则 ===${NC}"
+    read -p "确认操作？(y/n): " CONFIRM
+    [ "$CONFIRM" != "y" ] && return
+
+    # 清除 iptables
+    iptables -t nat -F PREROUTING
+    iptables -t nat -F POSTROUTING
+    iptables_save
+
+    # 清除 nftables
+    nft flush ruleset
+    rm -f /etc/nftables.conf
+
+    echo -e "${GREEN}所有规则已清除！${NC}"
 }
 
 # 主菜单
@@ -151,15 +160,17 @@ main_menu() {
     echo "1) iptables 转发 (TCP+UDP)"
     echo "2) nftables 转发 (TCP+UDP)"
     echo "3) 查看所有规则"
-    echo "4) 删除规则"
+    echo "4) 删除单条规则"
+    echo "5) 清除所有规则"
     echo -e "${RED}q) 退出${NC}"
-    read -p "请选择操作 [1-4/q]: " CHOICE
+    read -p "请选择操作 [1-5/q]: " CHOICE
 
     case $CHOICE in
         1) iptables_forward ;;
         2) nftables_forward ;;
         3) show_rules ;;
-        4) delete_rules ;;
+        4) delete_single_rule ;;
+        5) flush_all_rules ;;
         q) exit 0 ;;
         *) echo -e "${RED}无效操作！${NC}" ;;
     esac
