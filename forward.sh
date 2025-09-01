@@ -1,6 +1,6 @@
 #!/bin/bash
-# 功能：iptables/nftables 流量转发，同时支持 TCP/UDP，默认持久化
-# 特点：双协议支持、自动保存规则、简洁管理
+# 功能：iptables/nftables 转发，支持 TCP/UDP 合并查看和精准删除
+# 特点：规则合并显示、逐条删除、一键清空、持久化
 
 # 颜色定义
 RED='\033[0;31m'
@@ -59,17 +59,14 @@ iptables_forward() {
     read -p "远程地址 (IP): " TARGET_IP
     read -p "远程端口: " TARGET_PORT
 
-    # 启用IP转发
     sysctl -w net.ipv4.ip_forward=1
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-    # 添加TCP和UDP规则
     for PROTOCOL in tcp udp; do
         iptables -t nat -A PREROUTING -p $PROTOCOL --dport "$LOCAL_PORT" -j DNAT --to-destination "$TARGET_IP:$TARGET_PORT"
     done
     iptables -t nat -A POSTROUTING -j MASQUERADE
 
-    # 持久化
     iptables_save
     echo -e "${GREEN}iptables 规则已添加: ${LOCAL_IP}:${LOCAL_PORT} (TCP+UDP) -> ${TARGET_IP}:${TARGET_PORT}${NC}"
 }
@@ -80,11 +77,9 @@ nftables_forward() {
     read -p "远程地址 (IP): " TARGET_IP
     read -p "远程端口: " TARGET_PORT
 
-    # 启用IP转发
     sysctl -w net.ipv4.ip_forward=1
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-    # 生成nftables配置（同时监听TCP/UDP）
     cat > /etc/nftables.conf <<EOF
 table ip nat {
     chain prerouting {
@@ -104,36 +99,50 @@ EOF
 }
 
 #--------------------- 规则管理 ---------------------
-# 查看规则
+# 查看规则（合并TCP/UDP显示）
 show_rules() {
     echo -e "\n${YELLOW}=== 当前转发规则 ===${NC}"
+    
+    # iptables 规则合并显示
     echo -e "${GREEN}[iptables]${NC}"
-    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:"
+    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:" | awk '{printf "%-6s %-10s %-20s -> %s\n", $1, $7, $11, $NF}' | uniq
+    
+    # nftables 规则合并显示
     echo -e "\n${GREEN}[nftables]${NC}"
-    nft list ruleset | grep -A2 "dnat to"
+    nft list table ip nat 2>/dev/null | grep -E "tcp|udp" | awk '/dport/ {port=$NF} /dnat/ {print port, $NF}' | uniq
 }
 
-# 删除规则
+# 删除规则（支持逐条或清空）
 delete_rules() {
     echo -e "\n${YELLOW}=== 删除规则 ===${NC}"
-    echo "1) iptables"
-    echo "2) nftables"
-    read -p "选择类型 [1-2]: " CHOICE
+    echo "1) 删除 iptables 规则"
+    echo "2) 删除 nftables 规则"
+    echo "3) 一键清空所有规则"
+    read -p "选择操作 [1-3]: " CHOICE
 
     case $CHOICE in
         1)
-            iptables -t nat -L PREROUTING -n --line-numbers
-            read -p "输入要删除的规则编号: " NUM
-            iptables -t nat -D PREROUTING "$NUM"
-            iptables_save
+            echo -e "\n${YELLOW}=== iptables 规则列表 ===${NC}"
+            iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT.*to:"
+            read -p "输入要删除的规则编号（留空取消）: " NUM
+            [ -n "$NUM" ] && iptables -t nat -D PREROUTING "$NUM" && iptables_save
             ;;
         2)
-            nft flush ruleset
-            rm -f /etc/nftables.conf
+            echo -e "\n${YELLOW}=== nftables 规则列表 ===${NC}"
+            nft list table ip nat 2>/dev/null | grep -E "tcp|udp" -A2 | awk '/dport/ {port=$NF} /dnat/ {print NR, port, $NF}'
+            read -p "输入要删除的规则行号（留空取消）: " NUM
+            if [ -n "$NUM" ]; then
+                LINE=$(nft list table ip nat 2>/dev/null | grep -nE "tcp|udp" | awk -F: -v num="$NUM" 'NR==num {print $1}')
+                [ -n "$LINE" ] && sed -i "${LINE},$((LINE+2))d" /etc/nftables.conf && nft -f /etc/nftables.conf
+            fi
+            ;;
+        3)
+            iptables -t nat -F && iptables -t nat -X
+            nft flush ruleset && rm -f /etc/nftables.conf
+            echo -e "${GREEN}所有规则已清空！${NC}"
             ;;
         *) echo -e "${RED}无效选择！${NC}" ;;
     esac
-    echo -e "${GREEN}规则已删除！${NC}"
 }
 
 # 主菜单
