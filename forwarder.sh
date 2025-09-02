@@ -1,5 +1,5 @@
 #!/bin/bash
-# 多功能端口转发脚本 v3 - 优化协议选择显示
+# 多功能端口转发脚本 v4 - 进一步优化协议选择显示
 # 兼容 Alpine、Debian/Ubuntu、CentOS
 
 # 检查root权限
@@ -96,38 +96,39 @@ show_menu() {
     read -p "请选择功能 [0-6]: " choice
 }
 
-# 选择协议类型 - 改进显示效果
+# 选择协议类型 - 确保显示所有选项
 select_protocol() {
-    echo -e "\n请选择协议类型:"
-    echo "1 - TCP"
-    echo "2 - UDP"
-    echo "3 - 同时支持TCP和UDP"
-    read -p "请输入数字选择 [1-3]: " proto_choice
-    
-    case $proto_choice in
-        1)
-            echo "tcp"
-            ;;
-        2)
-            echo "udp"
-            ;;
-        3)
-            echo "all"
-            ;;
-        *)
-            echo "invalid"
-            ;;
-    esac
+    local proto=""
+    while [ -z "$proto" ] || [ "$proto" = "invalid" ]; do
+        echo -e "\n请选择协议类型:"
+        echo "1 - TCP"
+        echo "2 - UDP"
+        echo "3 - 同时支持TCP和UDP"
+        read -p "请输入数字选择 [1-3]: " proto_choice
+        
+        case $proto_choice in
+            1)
+                proto="tcp"
+                ;;
+            2)
+                proto="udp"
+                ;;
+            3)
+                proto="all"
+                ;;
+            *)
+                echo "无效的选择，请输入1、2或3"
+                proto="invalid"
+                ;;
+        esac
+    done
+    echo "$proto"
 }
 
 # 添加iptables转发规则
 add_iptables_rule() {
     echo "===== 添加iptables转发规则 ====="
     proto=$(select_protocol)
-    if [ "$proto" = "invalid" ]; then
-        echo "无效的协议选择，请输入1、2或3"
-        return
-    fi
     
     read -p "请输入本地端口: " local_port
     read -p "请输入目标IP: " target_ip
@@ -180,10 +181,6 @@ add_iptables_rule() {
 add_nftables_rule() {
     echo "===== 添加nftables转发规则 ====="
     proto=$(select_protocol)
-    if [ "$proto" = "invalid" ]; then
-        echo "无效的协议选择，请输入1、2或3"
-        return
-    fi
     
     read -p "请输入本地端口: " local_port
     read -p "请输入目标IP: " target_ip
@@ -235,10 +232,6 @@ add_nftables_rule() {
 add_socat_rule() {
     echo "===== 添加socat转发规则 ====="
     proto=$(select_protocol)
-    if [ "$proto" = "invalid" ]; then
-        echo "无效的协议选择，请输入1、2或3"
-        return
-    fi
     
     if [ "$proto" = "all" ]; then
         echo "socat 不支持同时选择TCP和UDP，将为您分别创建两个服务"
