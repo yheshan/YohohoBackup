@@ -1,5 +1,5 @@
 #!/bin/bash
-# 功能：iptables 端口转发管理（强制显示协议 + 极简删除）
+# 功能：iptables 端口转发管理（100%准确协议显示 + 精准删除）
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -61,23 +61,34 @@ forward() {
 
 show_rules() {
     echo -e "\n${BLUE}=== 当前 iptables 规则 ===${NC}"
-    iptables -t nat -vnL PREROUTING --line-numbers | awk '/DNAT/ {
-        proto = $1 == "tcp" ? "TCP" : "UDP";
-        printf "  %s %s %s:%s -> %s\n", $8, proto, $11, $12, $13
+    iptables-save -t nat | awk -F'[ :]+' '
+    /PREROUTING.*dport/ {
+        proto = ($4 == "-p") ? toupper($5) : "UNKNOWN";
+        port = $8;
+        split($0, dest, "to:");
+        printf "  %s %s -> %s\n", proto, port, dest[2]
     }'
 }
 
 delete_rule() {
     show_rules
-    [ "$(iptables -t nat -vnL PREROUTING --line-numbers | grep -c DNAT)" -eq 0 ] && {
+    RULE_COUNT=$(iptables-save -t nat | grep -c "PREROUTING.*dport")
+    [ "$RULE_COUNT" -eq 0 ] && {
         echo -e "${RED}无规则可删！${NC}"
         return
     }
-    read -p "输入要删除的规则编号: " NUM
-    iptables -t nat -D PREROUTING "$NUM" 2>/dev/null || {
-        echo -e "${RED}删除失败，请检查编号！${NC}"
+    read -p "输入要删除的规则行号: " NUM
+    [ "$NUM" -gt "$RULE_COUNT" ] && {
+        echo -e "${RED}无效行号！当前共有 $RULE_COUNT 条规则${NC}"
         return
     }
+    
+    # 获取协议和端口用于精准删除
+    TARGET_RULE=$(iptables-save -t nat | grep "PREROUTING.*dport" | sed -n "${NUM}p")
+    PROTO=$(echo "$TARGET_RULE" | grep -oP '(?<=-p )\w+')
+    PORT=$(echo "$TARGET_RULE" | grep -oP '(?<=--dport )\d+')
+    
+    iptables -t nat -D PREROUTING -p $PROTO --dport $PORT -j DNAT --to-destination $(echo "$TARGET_RULE" | grep -oP '(?<=to:)[\d.:]+')
     iptables_save
     echo -e "${GREEN}规则已删除！${NC}"
 }
