@@ -1,12 +1,10 @@
 #!/bin/sh
-# Alpine iptables端口转发管理工具
-# 基于系统原生iptables，支持TCP/UDP转发，规则自动持久化
+# Alpine iptables端口转发管理工具（修复版）
+# 解决iptables: not found错误
 
 # 配置文件路径
 RULES_FILE="/etc/iptables/forward_rules.v4"
-IPV6_RULES_FILE="/etc/iptables/forward_rules.v6"
 SAVE_FILE="/etc/iptables/rules.v4"
-IPV6_SAVE_FILE="/etc/iptables/rules.v6"
 
 # 确保目录存在
 mkdir -p /etc/iptables
@@ -17,19 +15,62 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# 安装必要工具
+# 检查命令是否存在
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# 安装必要工具（增强版）
 install_tools() {
     echo "正在检查必要工具..."
-    # 安装iptables和持久化工具
-    if ! command -v iptables >/dev/null 2>&1 || ! command -v iptables-save >/dev/null 2>&1; then
-        echo "安装iptables工具..."
-        apk add iptables iptables-save >/dev/null 2>&1 || {
-            echo "更换国内源重试..."
-            [ ! -f "/etc/apk/repositories.bak" ] && cp /etc/apk/repositories /etc/apk/repositories.bak
+    
+    # 检查iptables是否已安装
+    if ! command_exists iptables || ! command_exists iptables-save; then
+        echo "检测到未安装iptables，开始安装..."
+        
+        # 保存原始源
+        if [ ! -f "/etc/apk/repositories.bak" ]; then
+            cp /etc/apk/repositories /etc/apk/repositories.bak
+        fi
+        
+        # 尝试多种源安装
+        install_success=0
+        
+        # 尝试默认源
+        echo "尝试默认源安装..."
+        apk update >/dev/null 2>&1 && apk add iptables >/dev/null 2>&1 && install_success=1
+        
+        # 尝试阿里云源
+        if [ $install_success -eq 0 ]; then
+            echo "默认源安装失败，尝试阿里云源..."
             echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/main/" > /etc/apk/repositories
             echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/community/" >> /etc/apk/repositories
-            apk update >/dev/null 2>&1 && apk add iptables iptables-save >/dev/null 2>&1
-        }
+            apk update >/dev/null 2>&1 && apk add iptables >/dev/null 2>&1 && install_success=1
+        fi
+        
+        # 尝试华为云源
+        if [ $install_success -eq 0 ]; then
+            echo "阿里云源安装失败，尝试华为云源..."
+            echo "https://repo.huaweicloud.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/main/" > /etc/apk/repositories
+            echo "https://repo.huaweicloud.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/community/" >> /etc/apk/repositories
+            apk update >/dev/null 2>&1 && apk add iptables >/dev/null 2>&1 && install_success=1
+        fi
+        
+        # 检查是否安装成功
+        if [ $install_success -eq 0 ] || ! command_exists iptables; then
+            echo "=============================================="
+            echo "ERROR: 自动安装iptables失败，请手动执行以下命令："
+            echo ""
+            echo "1. 恢复源配置："
+            echo "   cp /etc/apk/repositories.bak /etc/apk/repositories 2>/dev/null || true"
+            echo ""
+            echo "2. 手动安装："
+            echo "   apk update && apk add iptables"
+            echo ""
+            echo "3. 安装成功后再运行本脚本"
+            echo "=============================================="
+            exit 1
+        fi
     fi
 
     # 启用IP转发并持久化
@@ -45,29 +86,26 @@ install_tools() {
 
     # 初始化规则文件
     [ ! -f "$RULES_FILE" ] && touch "$RULES_FILE"
-    [ ! -f "$IPV6_RULES_FILE" ] && touch "$IPV6_RULES_FILE"
 }
 
 # 保存当前规则
 save_rules() {
     # 保存所有iptables规则
     iptables-save > "$SAVE_FILE"
-    ip6tables-save > "$IPV6_SAVE_FILE"
     # 设置开机自动加载
     if ! rc-update show | grep -q "iptables"; then
         rc-update add iptables default >/dev/null 2>&1
     fi
+    echo "规则已保存"
 }
 
 # 加载保存的规则
 load_rules() {
     if [ -f "$SAVE_FILE" ]; then
         iptables-restore < "$SAVE_FILE"
-        echo "已加载IPv4规则"
-    fi
-    if [ -f "$IPV6_SAVE_FILE" ]; then
-        ip6tables-restore < "$IPV6_SAVE_FILE"
-        echo "已加载IPv6规则"
+        echo "已加载保存的规则"
+    else
+        echo "没有找到保存的规则文件"
     fi
 }
 
@@ -76,15 +114,11 @@ show_rules() {
     echo -e "\n===== 当前IPv4转发规则 ====="
     # 显示nat表中的PREROUTING链规则（端口转发规则）
     iptables -t nat -L PREROUTING --line-numbers | grep -v '^Chain\|^target\|^$'
-    echo -e "\n===== 转发规则说明 ====="
+    echo -e "\n===== 规则说明 ====="
     echo "num: 规则编号"
-    echo "target: 目标动作"
     echo "prot: 协议(TCP/UDP)"
-    echo "opt: 选项"
-    echo "source: 源地址"
-    echo "destination: 目标地址（本地监听地址）"
-    echo "ports: 端口（本地端口->目标端口）"
-    echo "to: 目标服务器IP"
+    echo "dpt: 本地端口"
+    echo "to: 目标服务器(IP:端口)"
 }
 
 # 添加转发规则
@@ -120,11 +154,21 @@ add_rule() {
     fi
 
     # 添加nat转发规则（PREROUTING链）
-    iptables -t nat -A PREROUTING -p "$protocol" --dport "$local_port" -d "$local_ip" -j DNAT --to-destination "$remote_ip:$remote_port"
+    if ! iptables -t nat -A PREROUTING -p "$protocol" --dport "$local_port" -d "$local_ip" -j DNAT --to-destination "$remote_ip:$remote_port"; then
+        echo "添加nat规则失败"
+        return 1
+    fi
     
     # 添加转发允许规则（FORWARD链）
-    iptables -A FORWARD -p "$protocol" --dport "$remote_port" -d "$remote_ip" -j ACCEPT
-    iptables -A FORWARD -p "$protocol" --sport "$remote_port" -s "$remote_ip" -j ACCEPT
+    if ! iptables -A FORWARD -p "$protocol" --dport "$remote_port" -d "$remote_ip" -j ACCEPT; then
+        echo "添加转发入站规则失败"
+        return 1
+    fi
+    
+    if ! iptables -A FORWARD -p "$protocol" --sport "$remote_port" -s "$remote_ip" -j ACCEPT; then
+        echo "添加转发出站规则失败"
+        return 1
+    fi
     
     # 保存规则到文件
     echo "$protocol $local_ip $local_port $remote_ip $remote_port" >> "$RULES_FILE"
@@ -150,14 +194,17 @@ delete_rule() {
         return 1
     fi
 
-    # 提取协议和端口信息（用于删除FORWARD链规则）
+    # 提取协议和端口信息
     protocol=$(echo "$rule" | awk '{print $3}')
     local_port=$(echo "$rule" | grep -oP 'dpt:\K\d+')
     remote_ip=$(echo "$rule" | grep -oP 'to:\K[^:]+')
     remote_port=$(echo "$rule" | grep -oP 'to:[^:]+:\K\d+')
 
     # 删除nat表中的PREROUTING规则
-    iptables -t nat -D PREROUTING "$rule_num"
+    if ! iptables -t nat -D PREROUTING "$rule_num"; then
+        echo "删除nat规则失败"
+        return 1
+    fi
     
     # 删除对应的FORWARD规则
     # 查找并删除入站规则
@@ -165,6 +212,7 @@ delete_rule() {
     if [ -n "$forward_num" ]; then
         iptables -D FORWARD "$forward_num"
     fi
+    
     # 查找并删除出站规则
     forward_num=$(iptables -L FORWARD --line-numbers | grep "$protocol" | grep "spt:$remote_port" | grep "$remote_ip" | awk '{print $1}' | head -n 1)
     if [ -n "$forward_num" ]; then
@@ -213,7 +261,7 @@ clear_all_rules() {
 show_menu() {
     clear
     echo "===================== iptables端口转发管理工具 ====================="
-    echo "基于系统原生iptables，高效稳定，支持TCP/UDP转发，规则自动持久化"
+    echo "基于系统原生iptables，高效稳定，支持TCP/UDP转发"
     echo "================================================================="
     echo "1. 添加转发规则（TCP/UDP可选）"
     echo "2. 删除单个规则"
