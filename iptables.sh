@@ -1,6 +1,5 @@
 #!/bin/bash
-# 功能：iptables 端口转发管理（支持TCP/UDP/TCP+UDP）
-# 特点：规则显示完整、协议可选、极简删除
+# 功能：iptables 端口转发管理（修复显示问题 + 极简删除）
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -62,16 +61,18 @@ forward() {
 
 show_rules() {
     echo -e "\n${BLUE}=== 当前 iptables 规则 ===${NC}"
-    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT" | awk '{
-        split($12, parts, ":");
-        printf "  %s %s %s -> %s:%s\n", $1, $7, $11, parts[1], parts[2]
+    iptables -t nat -vnL PREROUTING --line-numbers | grep -E "DNAT" | awk '{
+        printf "  %s %s %s -> %s\n", $1, $8, $12, $13
     }'
 }
 
 delete_rule() {
     show_rules
     read -p "输入要删除的规则编号: " NUM
-    iptables -t nat -D PREROUTING "$NUM"
+    iptables -t nat -D PREROUTING "$NUM" 2>/dev/null || {
+        echo -e "${RED}删除失败，请检查编号！${NC}"
+        return
+    }
     iptables_save
     echo -e "${GREEN}规则已删除！${NC}"
 }
