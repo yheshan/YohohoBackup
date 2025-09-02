@@ -1,22 +1,25 @@
 #!/bin/sh
-# Alpine iptables端口转发工具（修复语法错误版）
-# 解决括号不匹配问题，确保脚本正常运行
+# Alpine iptables端口转发工具（最终语法修复版）
+# 完全兼容ash shell，解决所有括号和语法错误
 
 RULES_FILE="/etc/iptables/forward_rules.v4"
 CHAIN_NAME="PORT_FORWARD"
 
 # 检查root权限
-[ "$(id -u)" -ne 0 ] && { echo "请用root权限运行: sudo $0"; exit 1; }
+if [ "$(id -u)" -ne 0 ]; then
+    echo "请用root权限运行: sudo $0"
+    exit 1
+fi
 
 # 安装iptables
 install_iptables() {
     echo "检查iptables环境..."
     if ! command -v iptables >/dev/null 2>&1; then
         echo "正在安装iptables..."
-        apk add iptables >/dev/null 2>&1 || {
+        if ! apk add iptables >/dev/null 2>&1; then
             echo "安装失败，请手动执行: apk update && apk add iptables"
             exit 1
-        }
+        fi
     fi
 }
 
@@ -42,10 +45,10 @@ ensure_chain_exists() {
     # 确保链已添加到PREROUTING
     if ! iptables -t nat -C PREROUTING -j $CHAIN_NAME 2>/dev/null; then
         echo "将链添加到PREROUTING..."
-        iptables -t nat -A PREROUTING -j $CHAIN_NAME || {
+        if ! iptables -t nat -A PREROUTING -j $CHAIN_NAME; then
             echo "添加链到PREROUTING失败"
             exit 1
-        }
+        fi
     fi
 }
 
@@ -87,7 +90,9 @@ load_rules() {
 show_rules() {
     echo -e "\n===== 当前转发规则 ====="
     iptables -t nat -L $CHAIN_NAME --line-numbers | grep -v "Chain\|target\|^$\|RETURN" | nl
-    [ $? -ne 0 ] && echo "没有配置转发规则"
+    if [ $? -ne 0 ]; then
+        echo "没有配置转发规则"
+    fi
     echo "======================="
 }
 
@@ -145,7 +150,7 @@ add_rule() {
     fi
 }
 
-# 删除规则（修复括号不匹配问题）
+# 删除规则（彻底修复语法错误）
 delete_rule() {
     show_rules
     
@@ -156,9 +161,12 @@ delete_rule() {
     fi
     
     rule_line=$(iptables -t nat -L $CHAIN_NAME --line-numbers | grep -v "Chain\|target\|^$\|RETURN" | sed -n "${rule_num}p")
-    [ -z "$rule_line" ] && { echo "编号不存在"; return 1; }
+    if [ -z "$rule_line" ]; then
+        echo "编号不存在"
+        return 1
+    fi
     
-    protocol=$(echo "$rule_line" | awk '{print $2}')  # 修复此处括号不匹配问题
+    protocol=$(echo "$rule_line" | awk '{print $2}')
     local_port=$(echo "$rule_line" | awk '{print $9}')
     remote_ip=$(echo "$rule_line" | awk '{print $12}' | cut -d: -f1)
     remote_port=$(echo "$rule_line" | awk '{print $12}' | cut -d: -f2)
@@ -176,7 +184,10 @@ delete_rule() {
 # 清除所有规则
 clear_all_rules() {
     read -p "确定清除所有规则？(y/n): " confirm
-    [ "$confirm" != "y" ] && { echo "取消操作"; return 0; }  # 修复重复文字
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        echo "取消操作"
+        return 0
+    fi
     
     iptables -t nat -F $CHAIN_NAME
     iptables -F INPUT
@@ -203,7 +214,7 @@ stop_forward() {
 # 显示菜单
 show_menu() {
     clear
-    echo "===================== iptables端口转发工具 ====================="  # 修复重复文字
+    echo "===================== iptables端口转发工具 ====================="
     echo "1. 添加转发规则"
     echo "2. 删除单个规则"
     echo "3. 清除所有规则"
