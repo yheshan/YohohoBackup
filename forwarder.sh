@@ -1,5 +1,5 @@
 #!/bin/bash
-# 多功能端口转发脚本 - 修复版
+# 多功能端口转发脚本 - 支持多协议和多目标
 # 兼容 Alpine、Debian/Ubuntu、CentOS
 
 # 检查root权限
@@ -23,17 +23,12 @@ detect_os() {
 
 OS=$(detect_os)
 
-# 规则存储文件
-IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
-NFTABLES_RULES_FILE="/etc/nftables.conf"
-SOCAT_SERVICE_DIR="/etc/socat-services"
-
 # 安装必要依赖
 install_dependencies() {
     echo "正在安装必要依赖..."
     case $OS in
         alpine)
-            apk update && apk add --no-cache iptables nftables socat curl wget libc6-compat openrc
+            apk update && apk add --no-cache iptables nftables socat curl wget libc6-compat
             ;;
         debian)
             apt update && apt install -y iptables nftables socat curl wget
@@ -47,22 +42,26 @@ install_dependencies() {
             exit 1
             ;;
     esac
-    
-    # 创建socat服务目录并设置权限
-    mkdir -p "$SOCAT_SERVICE_DIR"
-    chmod 755 "$SOCAT_SERVICE_DIR"
 }
 
-# 启用IP转发并持久化
+# 安装GOST
+install_gost() {
+    if ! command -v gost &> /dev/null; then
+        echo "正在安装GOST..."
+        GOST_URL="https://github.com/ginuerzh/gost/releases/latest/download/gost-linux-amd64"
+        if [ "$OS" = "alpine" ]; then
+            GOST_URL="https://github.com/ginuerzh/gost/releases/latest/download/gost-linux-amd64-musl"
+        fi
+        wget -q --no-check-certificate -O /usr/local/bin/gost $GOST_URL
+        chmod +x /usr/local/bin/gost
+    fi
+}
+
+# 启用IP转发
 enable_ip_forward() {
     echo "启用IP转发..."
-    # 临时启用
     echo 1 > /proc/sys/net/ipv4/ip_forward
-    
-    # 永久生效
-    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    fi
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
     sysctl -p > /dev/null
 }
 
@@ -73,281 +72,179 @@ show_menu() {
     echo "1. iptables 转发 (简单端口映射，高性能)"
     echo "2. nftables 转发 (新一代防火墙，支持复杂规则)"
     echo "3. socat 转发 (灵活的端口转发，支持多种协议)"
-    echo "4. 查看当前转发规则"
-    echo "5. 删除指定转发规则"
+    echo "4. GOST 转发 (支持加密隧道，多协议)"
+    echo "5. 查看当前转发规则"
     echo "6. 清除所有转发规则"
     echo "0. 退出"
     echo "======================================================"
     read -p "请选择功能 [0-6]: " choice
 }
 
-# 选择协议类型 - 修复显示问题
-select_protocol() {
-    # 保存当前输出缓冲区设置
-    local old_stty=$(stty -g)
-    
-    # 显示选项
-    echo -e "\n请选择协议类型:"
-    echo "1. TCP"
-    echo "2. UDP"
-    echo "3. ALL (同时支持TCP和UDP)"
-    
-    # 读取输入
-    read -p "请输入数字 [1-3]: " proto_choice
-    
-    # 恢复终端设置
-    stty $old_stty
-    
-    # 判断输入
-    case $proto_choice in
-        1)
-            echo "tcp"
-            ;;
-        2)
-            echo "udp"
-            ;;
-        3)
-            echo "all"
-            ;;
-        *)
-            echo "invalid"
-            ;;
-    esac
-}
-
-# 添加iptables转发规则 - 修复显示问题
+# 添加iptables转发规则
 add_iptables_rule() {
-    echo "===== 添加iptables转发规则 ====="
-    
-    # 获取协议选择
-    proto=$(select_protocol)
-    if [ "$proto" = "invalid" ]; then
-        echo "无效的协议选择，请重试"
-        return 1
-    fi
-    
-    # 读取端口和IP
+    read -p "请输入协议类型 (tcp/udp/all): " proto
     read -p "请输入本地端口: " local_port
     read -p "请输入目标IP: " target_ip
     read -p "请输入目标端口: " target_port
 
-    # 验证输入
-    if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$target_port" =~ ^[0-9]+$ ]]; then
-        echo "错误：端口必须是数字"
-        return 1
-    fi
-
-    if ! [[ "$target_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "错误：无效的IP地址格式"
-        return 1
-    fi
-
-    # 添加规则
     case $proto in
         tcp)
-            iptables -t nat -A PREROUTING -p tcp --dport "$local_port" -j DNAT --to-destination "$target_ip:$target_port"
+            iptables -t nat -A PREROUTING -p tcp --dport $local_port -j DNAT --to-destination $target_ip:$target_port
             ;;
         udp)
-            iptables -t nat -A PREROUTING -p udp --dport "$local_port" -j DNAT --to-destination "$target_ip:$target_port"
+            iptables -t nat -A PREROUTING -p udp --dport $local_port -j DNAT --to-destination $target_ip:$target_port
             ;;
         all)
-            iptables -t nat -A PREROUTING -p tcp --dport "$local_port" -j DNAT --to-destination "$target_ip:$target_port"
-            iptables -t nat -A PREROUTING -p udp --dport "$local_port" -j DNAT --to-destination "$target_ip:$target_port"
+            iptables -t nat -A PREROUTING -p tcp --dport $local_port -j DNAT --to-destination $target_ip:$target_port
+            iptables -t nat -A PREROUTING -p udp --dport $local_port -j DNAT --to-destination $target_ip:$target_port
+            ;;
+        *)
+            echo "无效的协议类型"
+            return
             ;;
     esac
     
-    # 确保有MASQUERADE规则
-    if ! iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -j MASQUERADE
-    fi
+    iptables -t nat -A POSTROUTING -j MASQUERADE
+    echo "iptables 转发规则已添加: $local_port -> $target_ip:$target_port ($proto)"
     
     # 保存规则
     case $OS in
         alpine)
-            iptables-save > "$IPTABLES_RULES_FILE"
+            iptables-save > /etc/iptables/rules.v4
             ;;
         debian)
-            iptables-save > "$IPTABLES_RULES_FILE"
-            if ! grep -q "iptables-restore < $IPTABLES_RULES_FILE" /etc/rc.local; then
-                echo "iptables-restore < $IPTABLES_RULES_FILE" >> /etc/rc.local
-                chmod +x /etc/rc.local
-            fi
+            iptables-save > /etc/iptables/rules.v4
             ;;
         centos)
             service iptables save
             ;;
     esac
-    
-    # 清晰显示结果
-    echo -e "\niptables 转发规则已添加:"
-    echo "本地端口: $local_port -> 目标: $target_ip:$target_port (协议: $proto)"
 }
 
-# 添加nftables转发规则 - 修复语法错误
+# 添加nftables转发规则
 add_nftables_rule() {
-    echo "===== 添加nftables转发规则 ====="
-    
-    # 获取协议选择
-    proto=$(select_protocol)
-    if [ "$proto" = "invalid" ]; then
-        echo "无效的协议选择，请重试"
-        return 1
-    fi
-    
-    # 读取端口和IP
+    read -p "请输入协议类型 (tcp/udp/all): " proto
     read -p "请输入本地端口: " local_port
     read -p "请输入目标IP: " target_ip
     read -p "请输入目标端口: " target_port
 
-    # 验证输入
-    if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$target_port" =~ ^[0-9]+$ ]]; then
-        echo "错误：端口必须是数字"
-        return 1
-    fi
+    # 初始化nftables
+    nft add table ip nat 2>/dev/null
+    nft add chain ip nat prerouting '{ type nat hook prerouting priority 0; policy accept; }' 2>/dev/null
+    nft add chain ip nat postrouting '{ type nat hook postrouting priority 100; policy accept; }' 2>/dev/null
 
-    if ! [[ "$target_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "错误：无效的IP地址格式"
-        return 1
-    fi
-
-    # 初始化nftables（使用正确的语法）
-    if ! nft list table ip nat >/dev/null 2>&1; then
-        nft add table ip nat
-        nft add chain ip nat prerouting '{ type nat hook prerouting priority 0; policy accept; }'
-        nft add chain ip nat postrouting '{ type nat hook postrouting priority 100; policy accept; }'
-    fi
-
-    # 添加规则（修复语法错误）
     case $proto in
         tcp)
-            nft add rule ip nat prerouting tcp dport "$local_port" dnat to "$target_ip:$target_port"
+            nft add rule ip nat prerouting tcp dport $local_port dnat to $target_ip:$target_port
             ;;
         udp)
-            nft add rule ip nat prerouting udp dport "$local_port" dnat to "$target_ip:$target_port"
+            nft add rule ip nat prerouting udp dport $local_port dnat to $target_ip:$target_port
             ;;
         all)
-            nft add rule ip nat prerouting tcp dport "$local_port" dnat to "$target_ip:$target_port"
-            nft add rule ip nat prerouting udp dport "$local_port" dnat to "$target_ip:$target_port"
+            nft add rule ip nat prerouting tcp dport $local_port dnat to $target_ip:$target_port
+            nft add rule ip nat prerouting udp dport $local_port dnat to $target_ip:$target_port
+            ;;
+        *)
+            echo "无效的协议类型"
+            return
             ;;
     esac
     
-    # 确保有masquerade规则
-    if ! nft list chain ip nat postrouting | grep -q "masquerade" 2>/dev/null; then
-        nft add rule ip nat postrouting masquerade
-    fi
+    nft add rule ip nat postrouting masquerade 2>/dev/null
+    echo "nftables 转发规则已添加: $local_port -> $target_ip:$target_port ($proto)"
     
-    # 保存规则并设置开机启动
-    nft list ruleset > "$NFTABLES_RULES_FILE"
-    
-    case $OS in
-        alpine)
-            if ! rc-update -s | grep -q "nftables.*default"; then
-                rc-update add nftables default
-            fi
-            ;;
-        debian|centos)
-            systemctl enable nftables
-            ;;
-    esac
-    
-    # 清晰显示结果
-    echo -e "\nnftables 转发规则已添加:"
-    echo "本地端口: $local_port -> 目标: $target_ip:$target_port (协议: $proto)"
+    # 保存规则
+    nft list ruleset > /etc/nftables.conf
 }
 
-# 添加socat转发规则 - 修复服务创建问题
+# 添加socat转发规则
 add_socat_rule() {
-    echo "===== 添加socat转发规则 ====="
-    
-    # 获取协议选择
-    proto=$(select_protocol)
-    if [ "$proto" = "invalid" ]; then
-        echo "无效的协议选择，请重试"
-        return 1
-    fi
-    
-    # 读取端口和IP
+    read -p "请输入协议类型 (tcp/udp): " proto
     read -p "请输入本地端口: " local_port
     read -p "请输入目标IP: " target_ip
     read -p "请输入目标端口: " target_port
+    read -p "是否后台运行? (y/n): " background
 
-    # 验证输入
-    if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$target_port" =~ ^[0-9]+$ ]]; then
-        echo "错误：端口必须是数字"
-        return 1
+    bg_flag=""
+    if [ "$background" = "y" ] || [ "$background" = "Y" ]; then
+        bg_flag="nohup"
+        log_file="/var/log/socat_${proto}_${local_port}.log"
     fi
 
-    if ! [[ "$target_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "错误：无效的IP地址格式"
-        return 1
-    fi
+    case $proto in
+        tcp)
+            cmd="$bg_flag socat TCP-LISTEN:$local_port,reuseaddr,fork TCP:$target_ip:$target_port"
+            ;;
+        udp)
+            cmd="$bg_flag socat UDP-LISTEN:$local_port,reuseaddr,fork UDP:$target_ip:$target_port"
+            ;;
+        *)
+            echo "无效的协议类型"
+            return
+            ;;
+    esac
 
-    if [ "$proto" = "all" ]; then
-        echo "socat将为TCP和UDP分别创建转发服务"
-        create_socat_service "tcp" "$local_port" "$target_ip" "$target_port"
-        create_socat_service "udp" "$local_port" "$target_ip" "$target_port"
+    if [ "$background" = "y" ] || [ "$background" = "Y" ]; then
+        $cmd > $log_file 2>&1 &
+        echo "socat 转发已在后台启动: $local_port -> $target_ip:$target_port ($proto)"
+        echo "日志文件: $log_file"
     else
-        create_socat_service "$proto" "$local_port" "$target_ip" "$target_port"
+        echo "启动 socat 转发 (按Ctrl+C停止):"
+        $cmd
     fi
 }
 
-# 创建socat服务的辅助函数 - 修复服务名称和权限问题
-create_socat_service() {
-    local proto=$1
-    local local_port=$2
-    local target_ip=$3
-    local target_port=$4
-    
-    # 确保参数有效
-    if [ -z "$proto" ] || [ -z "$local_port" ] || [ -z "$target_ip" ] || [ -z "$target_port" ]; then
-        echo "错误：无效的参数"
-        return 1
-    fi
-    
-    service_name="socat-${proto}-${local_port}.service"
-    service_path="$SOCAT_SERVICE_DIR/$service_name"
-    proto_upper=$(echo "$proto" | tr '[:lower:]' '[:upper:]')
-    
-    # 创建系统服务文件
-    cat << EOF > "$service_path"
-[Unit]
-Description=Socat forward service for $proto $local_port to $target_ip:$target_port
-After=network.target
+# 添加GOST转发规则
+add_gost_rule() {
+    read -p "请输入协议类型 (tcp/udp/all): " proto
+    read -p "请输入本地端口: " local_port
+    read -p "请输入目标IP: " target_ip
+    read -p "请输入目标端口: " target_port
+    read -p "是否使用加密隧道? (y/n): " encrypt
+    read -p "是否后台运行? (y/n): " background
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/socat $proto_upper-LISTEN:$local_port,reuseaddr,fork $proto_upper:$target_ip:$target_port
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    # 设置文件权限
-    chmod 644 "$service_path"
-    
-    # 设置服务
-    case $OS in
-        alpine)
-            # 确保服务可执行
-            ln -sf "$service_path" "/etc/init.d/$service_name"
-            chmod +x "/etc/init.d/$service_name"
-            
-            # 添加到启动项并启动
-            if ! rc-update -s | grep -q "$service_name.*default"; then
-                rc-update add "$service_name" default
-            fi
-            rc-service "$service_name" start
+    proto_flag=""
+    case $proto in
+        tcp)
+            proto_flag="tcp"
             ;;
-        debian|centos)
-            ln -sf "$service_path" "/etc/systemd/system/$service_name"
-            systemctl daemon-reload
-            systemctl enable "$service_name"
-            systemctl start "$service_name"
+        udp)
+            proto_flag="udp"
+            ;;
+        all)
+            proto_flag="tcp+udp"
+            ;;
+        *)
+            echo "无效的协议类型"
+            return
             ;;
     esac
+
+    # 基础转发规则
+    forward_rule="${proto_flag}://:${local_port}/${target_ip}:${target_port}"
     
-    echo "socat $proto 转发已启动: $local_port -> $target_ip:$target_port (后台运行)"
+    # 如果需要加密
+    if [ "$encrypt" = "y" ] || [ "$encrypt" = "Y" ]; then
+        read -p "请设置加密密钥: " secret
+        forward_rule="tls://:${local_port}?sni=example.com&secret=${secret}->${proto_flag}://${target_ip}:${target_port}"
+    fi
+
+    bg_flag=""
+    if [ "$background" = "y" ] || [ "$background" = "Y" ]; then
+        bg_flag="nohup"
+        log_file="/var/log/gost_${proto}_${local_port}.log"
+    fi
+
+    cmd="$bg_flag gost -L $forward_rule"
+
+    if [ "$background" = "y" ] || [ "$background" = "Y" ]; then
+        $cmd > $log_file 2>&1 &
+        echo "GOST 转发已在后台启动: $local_port -> $target_ip:$target_port ($proto)"
+        echo "日志文件: $log_file"
+    else
+        echo "启动 GOST 转发 (按Ctrl+C停止):"
+        $cmd
+    fi
 }
 
 # 查看当前规则
@@ -358,108 +255,12 @@ show_rules() {
     echo -e "\n===== nftables 规则 ====="
     nft list ruleset 2>/dev/null
     
-    echo -e "\n===== socat 服务 ====="
-    case $OS in
-        alpine)
-            rc-service --list | grep socat | grep -v "not found"
-            ;;
-        debian|centos)
-            systemctl list-units --type=service --full --all | grep socat | grep -v "not found"
-            ;;
-    esac
+    echo -e "\n===== socat 进程 ====="
+    ps aux | grep socat | grep -v grep
     
-    read -p "按任意键继续..."
-}
-
-# 删除指定规则
-delete_rule() {
-    echo "请选择要删除的规则类型:"
-    echo "1. iptables 规则"
-    echo "2. nftables 规则"
-    echo "3. socat 服务"
-    read -p "请输入数字 [1-3]: " type_choice
-
-    case $type_choice in
-        1) # 删除iptables规则
-            echo "当前iptables规则:"
-            iptables -t nat -L PREROUTING --line-numbers
-            read -p "请输入要删除的规则编号: " rule_num
-            if [ -n "$rule_num" ] && [ "$rule_num" -eq "$rule_num" ] 2>/dev/null; then
-                iptables -t nat -D PREROUTING "$rule_num"
-                # 保存更改
-                case $OS in
-                    alpine)
-                        iptables-save > "$IPTABLES_RULES_FILE"
-                        ;;
-                    debian)
-                        iptables-save > "$IPTABLES_RULES_FILE"
-                        ;;
-                    centos)
-                        service iptables save
-                        ;;
-                esac
-                echo "已删除iptables规则 #$rule_num"
-            else
-                echo "无效的规则编号"
-            fi
-            ;;
-            
-        2) # 删除nftables规则
-            echo "当前nftables规则:"
-            nft list chain ip nat prerouting
-            read -p "请输入要删除的规则编号: " rule_num
-            if [ -n "$rule_num" ] && [ "$rule_num" -eq "$rule_num" ] 2>/dev/null; then
-                nft delete rule ip nat prerouting "$rule_num"
-                nft list ruleset > "$NFTABLES_RULES_FILE"
-                echo "已删除nftables规则 #$rule_num"
-            else
-                echo "无效的规则编号"
-            fi
-            ;;
-            
-        3) # 删除socat服务
-            echo "当前socat服务:"
-            case $OS in
-                alpine)
-                    rc-service --list | grep socat | grep -v "not found"
-                    ;;
-                debian|centos)
-                    systemctl list-units --type=service --full --all | grep socat | grep -v "not found"
-                    ;;
-            esac
-            read -p "请输入要删除的服务名称 (例如: socat-tcp-8080.service): " service_name
-            if [ -n "$service_name" ] && [ -f "$SOCAT_SERVICE_DIR/$service_name" ]; then
-                # 停止并禁用服务
-                case $OS in
-                    alpine)
-                        rc-service "$service_name" stop
-                        rc-update del "$service_name"
-                        ;;
-                    debian|centos)
-                        systemctl stop "$service_name"
-                        systemctl disable "$service_name"
-                        ;;
-                esac
-                # 删除服务文件
-                rm -f "$SOCAT_SERVICE_DIR/$service_name"
-                rm -f "/etc/init.d/$service_name" 2>/dev/null
-                rm -f "/etc/systemd/system/$service_name" 2>/dev/null
-                
-                case $OS in
-                    debian|centos)
-                        systemctl daemon-reload
-                        ;;
-                esac
-                echo "已删除socat服务: $service_name"
-            else
-                echo "无效的服务名称"
-            fi
-            ;;
-            
-        *)
-            echo "无效选择，请输入1、2或3"
-            ;;
-    esac
+    echo -e "\n===== GOST 进程 ====="
+    ps aux | grep gost | grep -v grep
+    
     read -p "按任意键继续..."
 }
 
@@ -475,10 +276,10 @@ clear_rules() {
     iptables -t nat -X
     case $OS in
         alpine)
-            iptables-save > "$IPTABLES_RULES_FILE"
+            iptables-save > /etc/iptables/rules.v4
             ;;
         debian)
-            iptables-save > "$IPTABLES_RULES_FILE"
+            iptables-save > /etc/iptables/rules.v4
             ;;
         centos)
             service iptables save
@@ -486,31 +287,12 @@ clear_rules() {
     esac
 
     # 清除nftables规则
-    if nft list table ip nat >/dev/null 2>&1; then
-        nft flush table ip nat
-    fi
-    echo "" > "$NFTABLES_RULES_FILE" 2>/dev/null
+    nft flush ruleset 2>/dev/null
+    echo "" > /etc/nftables.conf 2>/dev/null
 
-    # 清除socat服务
-    case $OS in
-        alpine)
-            for service in $(rc-service --list | grep socat | grep -v "not found"); do
-                rc-service "$service" stop
-                rc-update del "$service"
-                rm -f "/etc/init.d/$service"
-                rm -f "$SOCAT_SERVICE_DIR/$service"
-            done
-            ;;
-        debian|centos)
-            for service in $(systemctl list-units --type=service --full --all | grep socat | grep -v "not found" | awk '{print $1}'); do
-                systemctl stop "$service"
-                systemctl disable "$service"
-                rm -f "/etc/systemd/system/$service"
-                rm -f "$SOCAT_SERVICE_DIR/$service"
-            done
-            systemctl daemon-reload
-            ;;
-    esac
+    # 终止socat和gost进程
+    pkill socat
+    pkill gost
 
     echo "所有转发规则已清除"
     read -p "按任意键继续..."
@@ -520,6 +302,7 @@ clear_rules() {
 main() {
     install_dependencies
     enable_ip_forward
+    install_gost
 
     while true; do
         show_menu
@@ -537,10 +320,11 @@ main() {
                 read -p "按任意键继续..."
                 ;;
             4)
-                show_rules
+                add_gost_rule
+                read -p "按任意键继续..."
                 ;;
             5)
-                delete_rule
+                show_rules
                 ;;
             6)
                 clear_rules
@@ -550,7 +334,7 @@ main() {
                 exit 0
                 ;;
             *)
-                echo "无效选择，请输入0-6之间的数字"
+                echo "无效选择，请重试"
                 read -p "按任意键继续..."
                 ;;
         esac
@@ -559,4 +343,3 @@ main() {
 
 # 启动主程序
 main
-    
