@@ -1,5 +1,5 @@
 #!/bin/bash
-# 多功能端口转发脚本 v2 - 支持多协议和多目标
+# 多功能端口转发脚本 v3 - 优化协议选择显示
 # 兼容 Alpine、Debian/Ubuntu、CentOS
 
 # 检查root权限
@@ -96,13 +96,13 @@ show_menu() {
     read -p "请选择功能 [0-6]: " choice
 }
 
-# 选择协议类型
+# 选择协议类型 - 改进显示效果
 select_protocol() {
-    echo "请选择协议类型:"
-    echo "1. TCP"
-    echo "2. UDP"
-    echo "3. 同时支持TCP和UDP"
-    read -p "请选择 [1-3]: " proto_choice
+    echo -e "\n请选择协议类型:"
+    echo "1 - TCP"
+    echo "2 - UDP"
+    echo "3 - 同时支持TCP和UDP"
+    read -p "请输入数字选择 [1-3]: " proto_choice
     
     case $proto_choice in
         1)
@@ -122,9 +122,10 @@ select_protocol() {
 
 # 添加iptables转发规则
 add_iptables_rule() {
+    echo "===== 添加iptables转发规则 ====="
     proto=$(select_protocol)
     if [ "$proto" = "invalid" ]; then
-        echo "无效的协议选择"
+        echo "无效的协议选择，请输入1、2或3"
         return
     fi
     
@@ -177,9 +178,10 @@ add_iptables_rule() {
 
 # 添加nftables转发规则
 add_nftables_rule() {
+    echo "===== 添加nftables转发规则 ====="
     proto=$(select_protocol)
     if [ "$proto" = "invalid" ]; then
-        echo "无效的协议选择"
+        echo "无效的协议选择，请输入1、2或3"
         return
     fi
     
@@ -231,16 +233,40 @@ add_nftables_rule() {
 
 # 添加socat转发规则（默认后台运行并设置开机启动）
 add_socat_rule() {
+    echo "===== 添加socat转发规则 ====="
     proto=$(select_protocol)
-    if [ "$proto" = "invalid" ] || [ "$proto" = "all" ]; then
-        echo "socat 只支持单独的TCP或UDP协议"
+    if [ "$proto" = "invalid" ]; then
+        echo "无效的协议选择，请输入1、2或3"
         return
     fi
     
-    read -p "请输入本地端口: " local_port
-    read -p "请输入目标IP: " target_ip
-    read -p "请输入目标端口: " target_port
+    if [ "$proto" = "all" ]; then
+        echo "socat 不支持同时选择TCP和UDP，将为您分别创建两个服务"
+        # 创建TCP规则
+        read -p "请输入本地端口: " local_port
+        read -p "请输入目标IP: " target_ip
+        read -p "请输入目标端口: " target_port
+        
+        # 先创建TCP服务
+        create_socat_service "tcp" $local_port $target_ip $target_port
+        
+        # 再创建UDP服务
+        create_socat_service "udp" $local_port $target_ip $target_port
+    else
+        read -p "请输入本地端口: " local_port
+        read -p "请输入目标IP: " target_ip
+        read -p "请输入目标端口: " target_port
+        create_socat_service $proto $local_port $target_ip $target_port
+    fi
+}
 
+# 创建socat服务的辅助函数
+create_socat_service() {
+    local proto=$1
+    local local_port=$2
+    local target_ip=$3
+    local target_port=$4
+    
     service_name="socat-${proto}-${local_port}.service"
     service_path="$SOCAT_SERVICE_DIR/$service_name"
     
@@ -275,7 +301,7 @@ add_socat_rule() {
             ;;
     esac
     
-    echo "socat 转发已启动并设置开机启动: $local_port -> $target_ip:$target_port ($proto)"
+    echo "socat $proto 转发已启动: $local_port -> $target_ip:$target_port"
 }
 
 # 查看当前规则
@@ -305,7 +331,7 @@ delete_rule() {
     echo "1. iptables 规则"
     echo "2. nftables 规则"
     echo "3. socat 服务"
-    read -p "请选择 [1-3]: " type_choice
+    read -p "请输入数字选择 [1-3]: " type_choice
 
     case $type_choice in
         1) # 删除iptables规则
@@ -382,7 +408,7 @@ delete_rule() {
             ;;
             
         *)
-            echo "无效选择"
+            echo "无效选择，请输入1、2或3"
             ;;
     esac
     read -p "按任意键继续..."
@@ -474,7 +500,7 @@ main() {
                 exit 0
                 ;;
             *)
-                echo "无效选择，请重试"
+                echo "无效选择，请输入0-6之间的数字"
                 read -p "按任意键继续..."
                 ;;
         esac
