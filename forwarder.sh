@@ -101,16 +101,10 @@ add_rule() {
     # 保存规则到配置文件
     echo "$tool $proto $local_port $dest_ip $dest_port $comment" >> $CONFIG_FILE
     
-    rule_number=$(grep -c '^[^#]' $CONFIG_FILE)
-    echo -e "\n规则已添加，编号为: $rule_number"
-    
-    # 默认自动启动规则，只需按回车或输入n取消
-    read -p "是否立即启动该规则? (y/n，默认y): " start_now
-    # 如果用户直接回车或输入y/Y，都启动规则
-    if [ -z "$start_now" ] || [ "$start_now" = "y" ] || [ "$start_now" = "Y" ]; then
-        start_rule $rule_number
-    else
-        echo "规则未立即启动，可稍后手动启动"
+    echo -e "\n规则已添加，编号为: $(grep -c '^[^#]' $CONFIG_FILE)"
+    read -p "是否立即启动该规则? (y/n): " start_now
+    if [ "$start_now" = "y" ]; then
+        start_rule $(grep -c '^[^#]' $CONFIG_FILE)
     fi
     read -p "按任意键返回菜单..."
 }
