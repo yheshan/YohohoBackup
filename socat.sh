@@ -1,11 +1,12 @@
 #!/bin/sh
-# Socat端口转发一键管理脚本 (Alpine Linux专用)
+# Socat端口转发一键管理脚本 (Alpine Linux专用) - 修复版
 # 支持TCP/UDP协议，规则持久化，多端口转发
 
 # 配置变量
 RULES_FILE="/etc/socat-rules.conf"
 SERVICE_FILE="/etc/init.d/socat-forward"
 PID_DIR="/var/run/socat"
+SCRIPT_PATH=$(readlink -f "$0")  # 获取当前脚本的绝对路径
 
 # 确保必要目录和文件存在
 init_env() {
@@ -26,12 +27,13 @@ init_env() {
 # 创建系统服务文件
 create_service_file() {
     if [ ! -f $SERVICE_FILE ]; then
-        cat > $SERVICE_FILE << 'EOF'
+        cat > $SERVICE_FILE << EOF
 #!/sbin/openrc-run
 # 提供socat转发服务的openrc服务脚本
 
-RULES_FILE="/etc/socat-rules.conf"
-PID_DIR="/var/run/socat"
+RULES_FILE="$RULES_FILE"
+PID_DIR="$PID_DIR"
+SCRIPT_PATH="$SCRIPT_PATH"
 
 depend() {
     need net
@@ -42,48 +44,20 @@ start() {
     ebegin "Starting socat forward services"
     
     # 确保PID目录存在
-    mkdir -p $PID_DIR
-    chmod 755 $PID_DIR
+    mkdir -p \$PID_DIR
+    chmod 755 \$PID_DIR
     
     # 启动所有规则
-    while IFS= read -r rule; do
-        # 跳过空行和注释
-        [ -z "$rule" ] || [ "${rule#\#}" != "$rule" ] && continue
-        
-        # 解析规则
-        id=$(echo "$rule" | awk '{print $1}')
-        proto=$(echo "$rule" | awk '{print $2}')
-        local_port=$(echo "$rule" | awk '{print $3}')
-        remote_host=$(echo "$rule" | awk '{print $4}')
-        remote_port=$(echo "$rule" | awk '{print $5}')
-        
-        # 启动转发进程
-        if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
-            socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_host:$remote_port &
-            echo $! > $PID_DIR/socat-tcp-$id.pid
-        fi
-        
-        if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
-            socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_host:$remote_port &
-            echo $! > $PID_DIR/socat-udp-$id.pid
-        fi
-    done < $RULES_FILE
-    
-    eend $?
+    \$SCRIPT_PATH --start-all
+    eend \$?
 }
 
 stop() {
     ebegin "Stopping socat forward services"
     
-    # 停止所有转发进程
-    for pidfile in $PID_DIR/*.pid; do
-        if [ -f "$pidfile" ]; then
-            kill $(cat "$pidfile") >/dev/null 2>&1
-            rm -f "$pidfile"
-        fi
-    done
-    
-    eend $?
+    # 停止所有规则
+    \$SCRIPT_PATH --stop-all
+    eend \$?
 }
 
 restart() {
@@ -92,6 +66,8 @@ restart() {
 }
 EOF
         chmod 755 $SERVICE_FILE
+        # 确保服务脚本有执行权限
+        chmod +x $SERVICE_FILE
     fi
 }
 
@@ -122,6 +98,64 @@ get_next_id() {
     echo $((last_id + 1))
 }
 
+# 检查规则运行状态
+check_rule_status() {
+    local rule_id=$1
+    local proto=$2
+    
+    local tcp_running=0
+    local udp_running=0
+    
+    # 检查TCP状态
+    if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
+        if [ -f "$PID_DIR/socat-tcp-$rule_id.pid" ]; then
+            pid=$(cat "$PID_DIR/socat-tcp-$rule_id.pid")
+            if ps -p $pid >/dev/null 2>&1; then
+                tcp_running=1
+            else
+                # 清理无效PID文件
+                rm -f "$PID_DIR/socat-tcp-$rule_id.pid"
+            fi
+        fi
+    fi
+    
+    # 检查UDP状态
+    if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
+        if [ -f "$PID_DIR/socat-udp-$rule_id.pid" ]; then
+            pid=$(cat "$PID_DIR/socat-udp-$rule_id.pid")
+            if ps -p $pid >/dev/null 2>&1; then
+                udp_running=1
+            else
+                # 清理无效PID文件
+                rm -f "$PID_DIR/socat-udp-$rule_id.pid"
+            fi
+        fi
+    fi
+    
+    # 返回状态文本
+    if [ "$proto" = "tcp" ]; then
+        if [ $tcp_running -eq 1 ]; then
+            echo "运行中"
+        else
+            echo "已停止"
+        fi
+    elif [ "$proto" = "udp" ]; then
+        if [ $udp_running -eq 1 ]; then
+            echo "运行中"
+        else
+            echo "已停止"
+        fi
+    else # both
+        if [ $tcp_running -eq 1 ] && [ $udp_running -eq 1 ]; then
+            echo "全部运行"
+        elif [ $tcp_running -eq 1 ] || [ $udp_running -eq 1 ]; then
+            echo "部分运行"
+        else
+            echo "已停止"
+        fi
+    fi
+}
+
 # 添加转发规则
 add_rule() {
     echo "===== 添加新转发规则 ====="
@@ -145,7 +179,12 @@ add_rule() {
     while true; do
         read -p "请输入本地监听端口 [1-65535]: " local_port
         if [[ $local_port =~ ^[0-9]+$ ]] && [ $local_port -ge 1 ] && [ $local_port -le 65535 ]; then
-            break
+            # 检查端口是否已被占用
+            if ss -tuln | grep -q ":$local_port"; then
+                echo "端口 $local_port 已被占用，请选择其他端口"
+            else
+                break
+            fi
         else
             echo "无效的端口号，请重新输入"
         fi
@@ -180,8 +219,8 @@ add_rule() {
 # 显示所有规则
 show_rules() {
     echo "===== 当前转发规则 ====="
-    echo "ID  协议      本地端口 -> 远程主机:端口"
-    echo "----------------------------------------"
+    echo "ID  协议      状态      本地端口 -> 远程主机:端口"
+    echo "------------------------------------------------"
     
     if [ ! -s $RULES_FILE ]; then
         echo "没有任何转发规则"
@@ -205,7 +244,10 @@ show_rules() {
             both) proto_display="TCP+UDP   " ;;
         esac
         
-        echo "$id   $proto_display $local_port -> $remote_host:$remote_port"
+        # 获取状态
+        status=$(check_rule_status $id $proto)
+        
+        echo "$id   $proto_display $status   $local_port -> $remote_host:$remote_port"
     done < $RULES_FILE
 }
 
@@ -274,9 +316,14 @@ start_single_rule() {
     # 启动TCP转发
     if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
         if ! pgrep -F $PID_DIR/socat-tcp-$rule_id.pid >/dev/null 2>&1; then
-            socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_host:$remote_port &
-            echo $! > $PID_DIR/socat-tcp-$rule_id.pid
-            echo "已启动 TCP 转发: $local_port -> $remote_host:$remote_port"
+            # 检查端口是否已被占用
+            if ss -tuln | grep -q ":$local_port"; then
+                echo "警告: 端口 $local_port 已被占用，TCP转发启动失败"
+            else
+                socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_host:$remote_port &
+                echo $! > $PID_DIR/socat-tcp-$rule_id.pid
+                echo "已启动 TCP 转发: $local_port -> $remote_host:$remote_port"
+            fi
         else
             echo "TCP 转发 $local_port -> $remote_host:$remote_port 已在运行"
         fi
@@ -285,9 +332,14 @@ start_single_rule() {
     # 启动UDP转发
     if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
         if ! pgrep -F $PID_DIR/socat-udp-$rule_id.pid >/dev/null 2>&1; then
-            socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_host:$remote_port &
-            echo $! > $PID_DIR/socat-udp-$rule_id.pid
-            echo "已启动 UDP 转发: $local_port -> $remote_host:$remote_port"
+            # 检查端口是否已被占用
+            if ss -tuln | grep -q ":$local_port"; then
+                echo "警告: 端口 $local_port 已被占用，UDP转发启动失败"
+            else
+                socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_host:$remote_port &
+                echo $! > $PID_DIR/socat-udp-$rule_id.pid
+                echo "已启动 UDP 转发: $local_port -> $remote_host:$remote_port"
+            fi
         else
             echo "UDP 转发 $local_port -> $remote_host:$remote_port 已在运行"
         fi
@@ -300,47 +352,85 @@ stop_single_rule() {
     
     # 停止TCP进程
     if [ -f $PID_DIR/socat-tcp-$rule_id.pid ]; then
-        if pgrep -F $PID_DIR/socat-tcp-$rule_id.pid >/dev/null 2>&1; then
-            kill $(cat $PID_DIR/socat-tcp-$rule_id.pid) >/dev/null 2>&1
+        pid=$(cat $PID_DIR/socat-tcp-$rule_id.pid)
+        if ps -p $pid >/dev/null 2>&1; then
+            kill $pid >/dev/null 2>&1
+            echo "已停止 TCP 转发 (ID: $rule_id)"
         fi
         rm -f $PID_DIR/socat-tcp-$rule_id.pid
     fi
     
     # 停止UDP进程
     if [ -f $PID_DIR/socat-udp-$rule_id.pid ]; then
-        if pgrep -F $PID_DIR/socat-udp-$rule_id.pid >/dev/null 2>&1; then
-            kill $(cat $PID_DIR/socat-udp-$rule_id.pid) >/dev/null 2>&1
+        pid=$(cat $PID_DIR/socat-udp-$rule_id.pid)
+        if ps -p $pid >/dev/null 2>&1; then
+            kill $pid >/dev/null 2>&1
+            echo "已停止 UDP 转发 (ID: $rule_id)"
         fi
         rm -f $PID_DIR/socat-udp-$rule_id.pid
     fi
 }
 
-# 启动所有规则
+# 启动所有规则（供服务调用）
 start_all_rules() {
-    $SERVICE_FILE start
+    if [ ! -s $RULES_FILE ]; then
+        echo "没有转发规则可启动"
+        return 0
+    fi
+    
+    while IFS= read -r rule; do
+        # 跳过空行和注释
+        [ -z "$rule" ] || [ "${rule#\#}" != "$rule" ] && continue
+        
+        id=$(echo "$rule" | awk '{print $1}')
+        start_single_rule $id
+    done < $RULES_FILE
 }
 
-# 停止所有规则
+# 停止所有规则（供服务调用）
 stop_all_rules() {
-    $SERVICE_FILE stop
-}
-
-# 重启所有规则
-restart_all_rules() {
-    $SERVICE_FILE restart
+    # 停止所有转发进程
+    for pidfile in $PID_DIR/*.pid; do
+        if [ -f "$pidfile" ]; then
+            pid=$(cat "$pidfile")
+            if ps -p $pid >/dev/null 2>&1; then
+                kill $pid >/dev/null 2>&1
+                echo "已停止转发进程 (PID: $pid)"
+            fi
+            rm -f "$pidfile"
+        fi
+    done
+    
+    # 额外安全检查：终止所有可能残留的socat进程
+    pkill -f "socat (TCP4|UDP4)-LISTEN" >/dev/null 2>&1
 }
 
 # 设置开机启动
 enable_boot_start() {
+    # 先删除可能存在的旧配置
+    rc-update del socat-forward default >/dev/null 2>&1
+    # 添加新配置
     rc-update add socat-forward default
+    # 保存配置
+    rc-update -u
     echo "已设置 socat 转发服务开机自启"
 }
 
 # 取消开机启动
 disable_boot_start() {
     rc-update del socat-forward default
+    rc-update -u
     echo "已取消 socat 转发服务开机自启"
 }
+
+# 命令行参数处理（供服务调用）
+if [ "$1" = "--start-all" ]; then
+    start_all_rules
+    exit 0
+elif [ "$1" = "--stop-all" ]; then
+    stop_all_rules
+    exit 0
+fi
 
 # 主菜单
 show_menu() {
@@ -350,7 +440,7 @@ show_menu() {
     echo "           Alpine Linux 版            "
     echo "======================================"
     echo "1. 添加新转发规则"
-    echo "2. 查看所有转发规则"
+    echo "2. 查看所有转发规则 (含状态)"
     echo "3. 删除指定转发规则"
     echo "4. 清空所有转发规则"
     echo "--------------------------------------"
@@ -390,7 +480,7 @@ main() {
             4) clear_all_rules ;;
             5) start_all_rules ;;
             6) stop_all_rules ;;
-            7) restart_all_rules ;;
+            7) stop_all_rules; start_all_rules ;;
             8) enable_boot_start ;;
             9) disable_boot_start ;;
             0) echo "再见!"; exit 0 ;;
