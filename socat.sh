@@ -1,12 +1,20 @@
 #!/bin/sh
-# Socat端口转发一键管理脚本 (Alpine Linux专用) - 端口占用修复版
-# 解决端口占用、规则状态异常和删除后无法重新添加的问题
+# Socat端口转发一键管理脚本 (Alpine Linux专用) - 精准端口检测版
+# 解决端口未被占用却误报占用的问题
 
 # 配置变量
 RULES_FILE="/etc/socat-rules.conf"
 SERVICE_FILE="/etc/init.d/socat-forward"
 PID_DIR="/var/run/socat"
 SCRIPT_PATH=$(readlink -f "$0")
+DEBUG_MODE=0  # 0=关闭调试, 1=开启调试
+
+# 调试输出函数
+debug() {
+    if [ $DEBUG_MODE -eq 1 ]; then
+        echo "DEBUG: $1"
+    fi
+}
 
 # 初始化环境
 init_env() {
@@ -91,17 +99,48 @@ install_dependencies() {
     echo "必要工具已准备就绪"
 }
 
-# 检查端口是否被占用（增强版）
-is_port_in_use() {
+# 检查端口是否被真正占用（排除TIME_WAIT状态）
+is_port_really_in_use() {
     local port=$1
     local in_use=1  # 默认为未占用
     
-    # 方法1：使用netstat检查
+    debug "检查端口 $port 是否被占用..."
+    
+    # 方法1：使用netstat检查，排除TIME_WAIT状态
     if netstat -tuln | grep -q ":$port "; then
+        debug "netstat 检测到端口 $port 被监听"
         in_use=0
-    # 方法2：使用lsof检查（如果可用）
-    elif command -v lsof >/dev/null 2>&1; then
-        if lsof -i :$port >/dev/null 2>&1; then
+    else
+        # 检查是否有TIME_WAIT状态的连接（不视为占用）
+        if netstat - tuln | grep -q ":$port "; then
+            debug "端口 $port 处于TIME_WAIT状态，不视为占用"
+        fi
+    fi
+    
+    # 方法2：使用lsof检查（如果可用），排除LISTEN状态以外的情况
+    if [ $in_use -eq 1 ] && command -v lsof >/dev/null 2>&1; then
+        if lsof -i :$port -sTCP:LISTEN >/dev/null 2>&1; then
+            debug "lsof 检测到端口 $port 被监听"
+            in_use=0
+        fi
+    fi
+    
+    # 方法3：尝试临时绑定端口验证
+    if [ $in_use -eq 1 ]; then
+        debug "尝试临时绑定端口 $port 验证..."
+        if ! socat TCP4-LISTEN:$port,reuseaddr,fork /dev/null >/dev/null 2>&1 & then
+            local temp_pid=$!
+            sleep 1
+            if ps -p $temp_pid >/dev/null 2>&1; then
+                kill $temp_pid >/dev/null 2>&1
+                debug "临时绑定成功，端口 $port 未被占用"
+                in_use=1
+            else
+                debug "临时绑定失败，端口 $port 被占用"
+                in_use=0
+            fi
+        else
+            debug "临时绑定失败，端口 $port 被占用"
             in_use=0
         fi
     fi
@@ -109,15 +148,34 @@ is_port_in_use() {
     return $in_use
 }
 
-# 显示占用端口的进程信息
-show_port_owner() {
+# 显示端口状态详情（供调试）
+show_port_details() {
     local port=$1
-    echo "端口 $port 被以下进程占用："
+    echo "端口 $port 状态详情："
+    
+    echo "1. netstat 结果："
+    netstat -tuln | grep ":$port" || echo "无监听记录"
+    
+    echo -e "\n2. 所有相关连接（包括TIME_WAIT）："
+    netstat -tuln | grep ":$port" || echo "无相关连接"
     
     if command -v lsof >/dev/null 2>&1; then
-        lsof -i :$port | grep -v "COMMAND"
+        echo -e "\n3. lsof 结果："
+        lsof -i :$port || echo "无相关进程"
+    fi
+    
+    echo -e "\n4. 临时绑定测试："
+    if socat TCP4-LISTEN:$port,reuseaddr,fork /dev/null >/dev/null 2>&1 & then
+        local temp_pid=$!
+        sleep 1
+        if ps -p $temp_pid >/dev/null 2>&1; then
+            kill $temp_pid >/dev/null 2>&1
+            echo "成功绑定，端口可用"
+        else
+            echo "绑定失败，端口不可用"
+        fi
     else
-        netstat -tulnp | grep ":$port "
+        echo "绑定失败，端口不可用"
     fi
 }
 
@@ -125,7 +183,7 @@ show_port_owner() {
 force_release_port() {
     local port=$1
     
-    if is_port_in_use $port; then
+    if is_port_really_in_use $port; then
         echo "尝试强制释放端口 $port..."
         
         # 使用lsof查找并杀死占用进程（如果可用）
@@ -153,7 +211,7 @@ force_release_port() {
         
         # 验证释放结果
         sleep 1
-        if is_port_in_use $port; then
+        if is_port_really_in_use $port; then
             echo "警告：端口 $port 仍无法释放，请手动检查"
             return 1
         else
@@ -250,22 +308,32 @@ add_rule() {
         *) echo "无效选项"; return ;;
     esac
     
-    # 输入本地端口（增加强制释放选项）
+    # 输入本地端口（增加手动验证选项）
     while true; do
         read -p "请输入本地监听端口 [1-65535]: " local_port
         if is_number "$local_port" && [ $local_port -ge 1 ] && [ $local_port -le 65535 ]; then
             # 检查端口是否已被占用
-            if is_port_in_use $local_port; then
-                show_port_owner $local_port
-                read -p "端口已被占用，是否尝试强制释放? [y/N]: " confirm
+            if is_port_really_in_use $local_port; then
+                echo "系统检测到端口 $local_port 被占用"
+                read -p "是否查看端口详情? [y/N]: " confirm
                 if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-                    if force_release_port $local_port; then
-                        break
+                    show_port_details $local_port
+                fi
+                
+                read -p "是否强制忽略检测并继续? [y/N]: " confirm_force
+                if [ "$confirm_force" = "y" ] || [ "$confirm_force" = "Y" ]; then
+                    break
+                else
+                    read -p "是否尝试强制释放该端口? [y/N]: " confirm_release
+                    if [ "$confirm_release" = "y" ] || [ "$confirm_release" = "Y" ]; then
+                        if force_release_port $local_port; then
+                            break
+                        else
+                            echo "请选择其他端口"
+                        fi
                     else
                         echo "请选择其他端口"
                     fi
-                else
-                    echo "请选择其他端口"
                 fi
             else
                 break
@@ -361,7 +429,7 @@ delete_rule() {
     echo "规则ID $rule_id 已删除"
     
     # 检查并释放端口
-    if is_port_in_use $local_port; then
+    if is_port_really_in_use $local_port; then
         echo "检测到端口 $local_port 仍被占用"
         read -p "是否尝试强制释放该端口? [y/N]: " confirm
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
@@ -391,7 +459,7 @@ clear_all_rules() {
         
         # 检查并释放残留端口
         for port in $ports; do
-            if is_port_in_use $port; then
+            if is_port_really_in_use $port; then
                 echo "检测到端口 $port 仍被占用"
                 read -p "是否尝试强制释放? [y/N]: " confirm
                 if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
@@ -420,9 +488,12 @@ start_single_rule() {
     remote_port=$(echo "$rule" | awk '{print $5}')
     
     # 启动前再次检查端口
-    if is_port_in_use $local_port; then
+    if is_port_really_in_use $local_port; then
         echo "错误：端口 $local_port 已被占用，无法启动转发"
-        show_port_owner $local_port
+        read -p "是否查看端口详情? [y/N]: " confirm
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+            show_port_details $local_port
+        fi
         return 1
     fi
     
@@ -521,6 +592,17 @@ stop_all_rules() {
     pkill -9 -f "socat (TCP4|UDP4)-LISTEN" >/dev/null 2>&1
 }
 
+# 切换调试模式
+toggle_debug() {
+    if [ $DEBUG_MODE -eq 0 ]; then
+        DEBUG_MODE=1
+        echo "已开启调试模式"
+    else
+        DEBUG_MODE=0
+        echo "已关闭调试模式"
+    fi
+}
+
 # 设置开机启动
 enable_boot_start() {
     rc-update del socat-forward default >/dev/null 2>&1
@@ -563,10 +645,11 @@ show_menu() {
     echo "--------------------------------------"
     echo "8. 设置开机自启动"
     echo "9. 取消开机自启动"
+    echo "10. $(if [ $DEBUG_MODE -eq 0 ]; then echo "开启"; else echo "关闭"; fi)调试模式"
     echo "--------------------------------------"
     echo "0. 退出"
     echo "======================================"
-    read -p "请输入操作选项 [0-9]: " choice
+    read -p "请输入操作选项 [0-10]: " choice
 }
 
 # 主程序
@@ -591,6 +674,7 @@ main() {
             7) stop_all_rules; start_all_rules ;;
             8) enable_boot_start ;;
             9) disable_boot_start ;;
+            10) toggle_debug ;;
             0) echo "再见!"; exit 0 ;;
             *) echo "无效选项，请重新输入" ;;
         esac
