@@ -1,6 +1,6 @@
 #!/bin/sh
-# Alpine Socat端口转发管理工具
-# 轻量稳定，兼容各种Alpine环境
+# Alpine Socat端口转发管理工具（优化版）
+# 支持TCP/UDP单独配置，修复删除规则冲突问题
 
 # 配置文件和工作目录
 CONFIG_FILE="/etc/socat_forward.conf"
@@ -29,9 +29,8 @@ check_network() {
     exit 1
 }
 
-# 安装socat（多种安装方式）
+# 安装socat
 install_socat() {
-    # 先检查是否已安装
     if command -v socat >/dev/null 2>&1; then
         return 0
     fi
@@ -39,41 +38,36 @@ install_socat() {
     check_network
     echo "正在安装socat..."
 
-    # 尝试默认源安装
-    apk add socat >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
+    # 尝试多种安装方式
+    apk add socat >/dev/null 2>&1 || {
+        echo "尝试更换国内源安装..."
+        [ ! -f "/etc/apk/repositories.bak" ] && cp /etc/apk/repositories /etc/apk/repositories.bak
+        echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/main/" > /etc/apk/repositories
+        echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/community/" >> /etc/apk/repositories
+        apk update >/dev/null 2>&1 && apk add socat >/dev/null 2>&1
+    }
+
+    if command -v socat >/dev/null 2>&1; then
         echo "socat安装成功"
         return 0
     fi
 
-    # 尝试更换国内源安装
-    echo "尝试更换国内源安装..."
-    if [ ! -f "/etc/apk/repositories.bak" ]; then
-        cp /etc/apk/repositories /etc/apk/repositories.bak
-    fi
-    echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/main/" > /etc/apk/repositories
-    echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/community/" >> /etc/apk/repositories
-    apk update >/dev/null 2>&1
-    apk add socat >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        echo "socat安装成功"
-        return 0
-    fi
-
-    # 手动编译安装的指引
-    echo "自动安装失败，请尝试手动安装："
-    echo "1. 更新源: apk update"
-    echo "2. 安装依赖: apk add socat"
-    echo "如果仍失败，请手动下载编译"
+    echo "请手动安装socat：apk update && apk add socat"
     exit 1
 }
 
-# 确保配置文件存在
+# 初始化配置文件
 init_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         echo "# Socat转发规则配置" > "$CONFIG_FILE"
-        echo "# 格式: 本地IP 本地端口 目标IP 目标端口 协议(TCP/UDP)" >> "$CONFIG_FILE"
+        echo "# 格式: 本地IP 本地端口 目标IP 目标端口 协议(TCP/UDP) 规则ID" >> "$CONFIG_FILE"
     fi
+}
+
+# 生成唯一规则ID
+generate_id() {
+    # 使用随机字符串确保唯一性
+    echo "$1_$2_$5_$(head -c 8 /dev/urandom | xxd -p -c 8)"
 }
 
 # 显示当前规则
@@ -87,11 +81,6 @@ show_rules() {
     echo "======================="
 }
 
-# 生成规则ID
-generate_id() {
-    echo "$1_$2_$5" | tr '.' '_' | tr ':' '_'
-}
-
 # 启动单个转发规则
 start_single_rule() {
     local_ip=$1
@@ -99,9 +88,9 @@ start_single_rule() {
     remote_ip=$3
     remote_port=$4
     protocol=$5
-    id=$(generate_id "$local_ip" "$local_port" "$protocol")
-    pid_file="$PID_DIR/$id.pid"
-    log_file="$LOG_DIR/$id.log"
+    rule_id=$6
+    pid_file="$PID_DIR/$rule_id.pid"
+    log_file="$LOG_DIR/$rule_id.log"
 
     # 检查是否已在运行
     if [ -f "$pid_file" ] && ps -p $(cat "$pid_file") >/dev/null 2>&1; then
@@ -117,16 +106,13 @@ start_single_rule() {
 
     # 记录PID
     echo $! > "$pid_file"
-    echo "启动转发: $local_ip:$local_port ($protocol) -> $remote_ip:$remote_port (PID: $(cat "$pid_file"))"
+    echo "启动转发: $local_ip:$local_port ($protocol) -> $remote_ip:$remote_port"
 }
 
 # 停止单个转发规则
 stop_single_rule() {
-    local_ip=$1
-    local_port=$2
-    protocol=$3
-    id=$(generate_id "$local_ip" "$local_port" "$protocol")
-    pid_file="$PID_DIR/$id.pid"
+    rule_id=$1
+    pid_file="$PID_DIR/$rule_id.pid"
 
     if [ -f "$pid_file" ]; then
         pid=$(cat "$pid_file")
@@ -139,11 +125,10 @@ stop_single_rule() {
             fi
         fi
         rm -f "$pid_file"
-        echo "停止转发: $local_ip:$local_port ($protocol)"
     fi
 }
 
-# 添加转发规则
+# 添加转发规则（支持TCP/UDP单独配置）
 add_rule() {
     echo -e "\n===== 添加新转发规则 ====="
     
@@ -175,21 +160,18 @@ add_rule() {
         return 1
     fi
     
-    # 检查端口是否已被使用
-    if grep -qE "^[[:space:]]*$local_ip[[:space:]]+$local_port[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]*$protocol[[:space:]]*$" "$CONFIG_FILE"; then
-        echo "错误：$protocol 本地端口 $local_port 已被使用"
-        return 1
-    fi
+    # 生成唯一规则ID
+    rule_id=$(generate_id "$local_ip" "$local_port" "$protocol")
     
     # 添加规则到配置文件
-    echo "$local_ip $local_port $remote_ip $remote_port $protocol" >> "$CONFIG_FILE"
+    echo "$local_ip $local_port $remote_ip $remote_port $protocol $rule_id" >> "$CONFIG_FILE"
     echo "规则添加成功：$local_ip:$local_port ($protocol) -> $remote_ip:$remote_port"
     
     # 立即启动该规则
-    start_single_rule "$local_ip" "$local_port" "$remote_ip" "$remote_port" "$protocol"
+    start_single_rule "$local_ip" "$local_port" "$remote_ip" "$remote_port" "$protocol" "$rule_id"
 }
 
-# 删除单个规则
+# 删除单个规则（修复冲突问题）
 delete_rule() {
     show_rules
     
@@ -199,18 +181,18 @@ delete_rule() {
         return 1
     fi
     
-    # 获取要删除的行
+    # 获取要删除的行和规则ID
     line=$(grep -v '^#\|^$' "$CONFIG_FILE" | sed -n "${rule_num}p")
     if [ -z "$line" ]; then
         echo "规则编号不存在"
         return 1
     fi
     
-    # 解析规则信息并停止该规则
-    local_ip=$(echo "$line" | awk '{print $1}')
-    local_port=$(echo "$line" | awk '{print $2}')
-    protocol=$(echo "$line" | awk '{print $5}')
-    stop_single_rule "$local_ip" "$local_port" "$protocol"
+    # 解析规则ID
+    rule_id=$(echo "$line" | awk '{print $6}')
+    
+    # 只停止当前规则的进程
+    stop_single_rule "$rule_id"
     
     # 备份并删除规则
     cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
@@ -228,23 +210,24 @@ clear_all_rules() {
         return 0
     fi
     
-    # 先停止所有规则
-    stop_service
+    # 停止所有规则进程
+    for pid_file in "$PID_DIR"/*.pid; do
+        [ -f "$pid_file" ] && rm -f "$pid_file" && kill $(cat "$pid_file") >/dev/null 2>&1
+    done
     
     # 备份配置文件
     cp "$CONFIG_FILE" "$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
     
     # 重建配置文件
     echo "# Socat转发规则配置" > "$CONFIG_FILE"
-    echo "# 格式: 本地IP 本地端口 目标IP 目标端口 协议(TCP/UDP)" >> "$CONFIG_FILE"
+    echo "# 格式: 本地IP 本地端口 目标IP 目标端口 协议(TCP/UDP) 规则ID" >> "$CONFIG_FILE"
     
     echo "所有转发规则已清除"
 }
 
-# 启动所有规则
-start_service() {
+# 启动所有规则（系统重启后可手动执行）
+start_all_rules() {
     echo "启动所有转发规则..."
-    # 读取配置文件中的所有规则并启动
     while IFS= read -r line; do
         # 跳过注释和空行
         echo "$line" | grep -q '^#\|^$' && continue
@@ -254,71 +237,27 @@ start_service() {
         remote_ip=$(echo "$line" | awk '{print $3}')
         remote_port=$(echo "$line" | awk '{print $4}')
         protocol=$(echo "$line" | awk '{print $5}')
+        rule_id=$(echo "$line" | awk '{print $6}')
         # 启动规则
-        start_single_rule "$local_ip" "$local_port" "$remote_ip" "$remote_port" "$protocol"
+        start_single_rule "$local_ip" "$local_port" "$remote_ip" "$remote_port" "$protocol" "$rule_id"
     done < "$CONFIG_FILE"
     echo "所有规则启动完成"
 }
 
-# 停止所有规则
-stop_service() {
-    echo "停止所有转发规则..."
-    # 停止所有正在运行的转发进程
-    for pid_file in "$PID_DIR"/*.pid; do
-        if [ -f "$pid_file" ]; then
-            pid=$(cat "$pid_file")
-            if ps -p $pid >/dev/null 2>&1; then
-                kill $pid >/dev/null 2>&1
-                sleep 0.5
-                if ps -p $pid >/dev/null 2>&1; then
-                    kill -9 $pid >/dev/null 2>&1
-                fi
-            fi
-            rm -f "$pid_file"
-        fi
-    done
-    echo "所有规则已停止"
-}
-
-# 重启所有规则
-restart_service() {
-    stop_service
-    sleep 1
-    start_service
-}
-
-# 设置开机自启
-setup_autostart() {
-    # 创建启动脚本
-    if [ ! -f "/etc/init.d/socat_forward" ]; then
-        cat > "/etc/init.d/socat_forward" << EOF
-#!/sbin/openrc-run
-command="$0"
-command_args="start"
-EOF
-        chmod +x "/etc/init.d/socat_forward"
-        rc-update add socat_forward default >/dev/null 2>&1
-        echo "已设置开机自启"
-    fi
-}
-
-# 显示菜单
+# 显示菜单（精简版）
 show_menu() {
     clear
     echo "===================== Alpine Socat转发管理工具 ====================="
-    echo "基于socat实现，支持TCP/UDP多端口转发，规则自动持久化"
+    echo "支持TCP/UDP单独配置，规则自动持久化"
     echo "================================================================="
-    echo "1. 添加转发规则"
+    echo "1. 添加转发规则（TCP/UDP可选）"
     echo "2. 删除单个规则"
     echo "3. 清除所有规则"
-    echo "4. 启动所有转发规则"
-    echo "5. 停止所有转发规则"
-    echo "6. 重启所有转发规则"
-    echo "7. 查看当前规则"
-    echo "8. 设置开机自启"
+    echo "4. 启动所有规则（重启后执行）"
+    echo "5. 查看当前规则"
     echo "0. 退出"
     echo "================================================================="
-    read -p "请选择操作 [0-8]: " choice
+    read -p "请选择操作 [0-5]: " choice
 }
 
 # 主程序
@@ -332,11 +271,8 @@ main() {
             1) add_rule ;;
             2) delete_rule ;;
             3) clear_all_rules ;;
-            4) start_service ;;
-            5) stop_service ;;
-            6) restart_service ;;
-            7) show_rules ;;
-            8) setup_autostart ;;
+            4) start_all_rules ;;
+            5) show_rules ;;
             0) 
                 echo "感谢使用，再见！"
                 exit 0 
