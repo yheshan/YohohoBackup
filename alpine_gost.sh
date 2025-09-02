@@ -1,6 +1,6 @@
 #!/bin/sh
-# 适配Alpine系统的Multi-EasyGost脚本
-# 基于原版修改：移除bash依赖，适配apk包管理，兼容ash shell
+# 适配Alpine系统的Multi-EasyGost脚本（修复架构检测）
+# 解决"不支持的架构"问题，优化错误提示
 
 # 检查root权限
 if [ "$(id -u)" -ne 0 ]; then
@@ -10,14 +10,12 @@ fi
 
 # 定义变量
 GOST_VER="2.11.5"
-GOST_FILE="gost-linux-$(uname -m)"
-GOST_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VER}/${GOST_FILE}-v${GOST_VER}.gz"
 GOST_PATH="/usr/local/bin/gost"
 CONFIG_DIR="/etc/gost"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 SERVICE_FILE="/etc/init.d/gost"
 
-# 确保基础工具存在（Alpine精简版可能缺失）
+# 确保基础工具存在
 ensure_dependencies() {
     echo "检查必要工具..."
     local deps="wget gunzip coreutils grep sed"
@@ -25,14 +23,14 @@ ensure_dependencies() {
         if ! command -v $dep >/dev/null 2>&1; then
             echo "安装缺失的工具: $dep"
             if ! apk add --no-cache $dep; then
-                echo "安装$dep失败，请请手动请手动执行: apkapk update update && apk add $deps"
+                echo "安装$dep失败，请手动执行: apk update && apk add $deps"
                 exit 1
             fi
         fi
     done
 }
 
-# 安装gost
+# 安装gost（修复架构检测）
 install_gost() {
     if [ -x "$GOST_PATH" ]; then
         echo "gost已安装"
@@ -41,27 +39,42 @@ install_gost() {
 
     ensure_dependencies
     
-    echo "下载下载安装安装gost v${GOST_VER}..."
-    # 处理架构名称差异    local arch=$(uname -m)
+    echo "下载并安装gost v${GOST_VER}..."
+    # 正确获取并处理架构（核心修复）
+    local arch=$(uname -m)
+    echo "检测到系统架构: $arch"  # 显示实际检测到的架构
+    
+    # 扩展架构映射，适配更多Alpine支持的架构
     case $arch in
-        x86_64) arch="amd64" ;;
-        aarch64) arch="arm64" ;;
-        armv7l) arch="armv7" ;;
+        x86_64|amd64)       gost_arch="amd64" ;;
+        aarch64|arm64)      gost_arch="arm64" ;;
+        armv7l|armv7)       gost_arch="armv7" ;;
+        i386|i686)          gost_arch="386" ;;
+        armv6l)             gost_arch="armv6" ;;
+        mips|mipsel)        gost_arch="mips" ;;
+        mips64|mips64le)    gost_arch="mips64" ;;
         *) 
-            echo "不支持的架构: $arch"
+            echo "错误：不支持的架构 '$arch'"
+            echo "请手动下载对应版本：https://github.com/ginuerzh/gost/releases/tag/v${GOST_VER}"
             exit 1
             ;;
     esac
-    GOST_FILE="gost-linux-${arch}"
-    GOST_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VER}/${GOST_FILE}-v${GOST_VER}.gz"
+
+    # 构建下载链接
+    local GOST_FILE="gost-linux-${gost_arch}"
+    local GOST_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VER}/${GOST_FILE}-v${GOST_VER}.gz"
 
     # 下载并安装
-    wget -q -O - "$GOST_URL" | gunzip > "$GOST_PATH"
+    echo "正在从 ${GOST_URL} 下载..."
+    if ! wget -q -O - "$GOST_URL" | gunzip > "$GOST_PATH"; then
+        echo "下载失败，可能是架构不匹配或网络问题"
+        exit 1
+    fi
     chmod +x "$GOST_PATH"
 
     # 验证安装
     if ! command -v gost >/dev/null 2>&1; then
-        echo "gost安装失败"
+        echo "gost安装失败，请检查文件权限"
         exit 1
     fi
 }
@@ -79,7 +92,7 @@ EOF
     fi
 }
 
-# 创建OpenRC服务（替换systemd）
+# 创建OpenRC服务
 create_service() {
     if [ -f "$SERVICE_FILE" ]; then
         return 0
@@ -115,7 +128,6 @@ stop() {
 EOF
 
     chmod +x "$SERVICE_FILE"
-    # 添加到开机启动
     rc-update add gost default >/dev/null 2>&1
     echo "gost服务已创建，支持开机自启"
 }
@@ -163,9 +175,8 @@ add_forward() {
         return 1
     fi
 
-    # 使用sed修改JSON（Alpine无jq，用基础命令适配）
+    # 修改JSON配置
     sed -i "s/\"ServeNodes\": \[\]/\"ServeNodes\": [\"$node\"]/" "$CONFIG_FILE"
-    # 如果已有规则，追加而非替换
     if [ $(grep -c "\"ServeNodes\": \[\]" "$CONFIG_FILE") -eq 0 ] && [ $(grep -c "$node" "$CONFIG_FILE") -eq 0 ]; then
         sed -i "s/\(\"ServeNodes\": \[\)\(.*\)\(\]\)/\1\2, \"$node\"\3/" "$CONFIG_FILE"
     fi
@@ -183,7 +194,6 @@ show_rules() {
         return 1
     fi
     
-    # 提取规则（基础文本处理，替代jq）
     grep -oP '"ServeNodes": \K\[.*?\]' "$CONFIG_FILE" | sed 's/\["//;s/"\]//;s/", "/\n/g' | nl
     if [ $? -ne 0 ]; then
         echo "无规则"
@@ -199,23 +209,20 @@ delete_rule() {
         return 1
     fi
 
-    # 获取规则内容
     local rule=$(grep -oP '"ServeNodes": \K\[.*?\]' "$CONFIG_FILE" | sed 's/\["//;s/"\]//;s/", "/\n/g' | sed -n "${num}p")
     if [ -z "$rule" ]; then
         echo "规则不存在"
         return 1
     fi
 
-    # 从配置中删除
     sed -i "s/, \"$rule\"//;s/\"$rule\", //;s/\"$rule\"//" "$CONFIG_FILE"
-    # 处理空数组情况
     sed -i 's/"ServeNodes": \[\]/\"ServeNodes\": []/' "$CONFIG_FILE"
 
     echo "已删除规则: $rule"
     restart_gost
 }
 
-# 启动gost
+# 服务控制函数
 start_gost() {
     if rc-service gost status >/dev/null 2>&1; then
         echo "gost已在运行"
@@ -225,7 +232,6 @@ start_gost() {
     echo "gost启动成功"
 }
 
-# 停止gost
 stop_gost() {
     if ! rc-service gost status >/dev/null 2>&1; then
         echo "gost未运行"
@@ -235,7 +241,6 @@ stop_gost() {
     echo "gost已停止"
 }
 
-# 重启gost
 restart_gost() {
     if rc-service gost status >/dev/null 2>&1; then
         rc-service gost restart
@@ -278,11 +283,7 @@ show_menu() {
 
 # 主程序
 main() {
-    # 确保运行在ash兼容模式
-    if [ -z "$BASH_VERSION" ]; then
-        set -o posix
-    fi
-
+    set -o posix  # 确保ash兼容性
     while true; do
         show_menu
         case $choice in
