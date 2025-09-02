@@ -1,6 +1,6 @@
 #!/bin/sh
-# Alpine端口转发一键管理脚本
-# 基于rinetd实现，支持多端口转发、规则持久化
+# Alpine端口转发一键管理脚本（增强版）
+# 解决网络问题导致的rinetd安装失败
 
 # 配置文件路径
 RINETD_CONF="/etc/rinetd.conf"
@@ -12,15 +12,68 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# 安装rinetd（如果未安装）
+# 网络检查函数
+check_network() {
+    echo "正在检查网络连接..."
+    # 尝试ping通多个公共服务器
+    for host in "mirrors.aliyun.com" "dl-cdn.alpinelinux.org" "8.8.8.8"; do
+        if ping -c 2 -W 3 "$host" >/dev/null 2>&1; then
+            echo "网络连接正常"
+            return 0
+        fi
+    done
+    echo "错误：网络连接失败，请检查网络设置"
+    exit 1
+}
+
+# 更换为国内镜像源（解决安装失败问题）
+change_mirror() {
+    echo "正在更换为国内镜像源..."
+    # 备份原有源配置
+    if [ ! -f "/etc/apk/repositories.bak" ]; then
+        cp /etc/apk/repositories /etc/apk/repositories.bak
+    fi
+    
+    # 使用阿里云镜像源
+    echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/main/" > /etc/apk/repositories
+    echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/community/" >> /etc/apk/repositories
+    
+    # 更新源索引
+    apk update >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        echo "更换镜像源失败，尝试使用华为云镜像源..."
+        # 尝试华为云镜像源
+        echo "https://repo.huaweicloud.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/main/" > /etc/apk/repositories
+        echo "https://repo.huaweicloud.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/community/" >> /etc/apk/repositories
+        apk update >/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            echo "镜像源更新失败，请手动检查网络"
+            exit 1
+        fi
+    fi
+}
+
+# 安装rinetd（增强版，带重试和镜像切换）
 install_rinetd() {
+    # 先检查网络
+    check_network
+    
+    # 尝试安装rinetd
     if ! command -v rinetd >/dev/null 2>&1; then
         echo "正在安装rinetd..."
-        apk update >/dev/null 2>&1
+        # 先尝试默认源安装
         apk add rinetd >/dev/null 2>&1
         if [ $? -ne 0 ]; then
-            echo "安装rinetd失败，请检查网络连接"
-            exit 1
+            echo "默认源安装失败，尝试更换国内镜像源..."
+            change_mirror
+            # 再次尝试安装
+            apk add rinetd >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                echo "安装rinetd失败，尝试手动安装："
+                echo "1. 执行: apk update && apk add rinetd"
+                echo "2. 若仍失败，请检查网络或手动下载安装"
+                exit 1
+            fi
         fi
     fi
     
