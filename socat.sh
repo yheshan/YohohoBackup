@@ -1,20 +1,12 @@
 #!/bin/sh
-# Socat端口转发一键管理脚本 (Alpine Linux专用) - 精准端口检测版
-# 解决端口未被占用却误报占用的问题
+# Socat端口转发一键管理脚本 (Alpine Linux专用) - 无端口检测版
+# 移除所有端口占用检测，直接尝试启动转发
 
 # 配置变量
 RULES_FILE="/etc/socat-rules.conf"
 SERVICE_FILE="/etc/init.d/socat-forward"
 PID_DIR="/var/run/socat"
 SCRIPT_PATH=$(readlink -f "$0")
-DEBUG_MODE=0  # 0=关闭调试, 1=开启调试
-
-# 调试输出函数
-debug() {
-    if [ $DEBUG_MODE -eq 1 ]; then
-        echo "DEBUG: $1"
-    fi
-}
 
 # 初始化环境
 init_env() {
@@ -79,149 +71,7 @@ install_dependencies() {
         fi
     fi
     
-    # 安装net-tools（含netstat）
-    if ! command -v netstat >/dev/null 2>&1; then
-        echo "安装 net-tools..."
-        if ! apk add --no-cache net-tools >/dev/null; then
-            echo "错误：无法安装net-tools，请检查网络"
-            exit 1
-        fi
-    fi
-    
-    # 安装lsof用于更精确的端口占用检查
-    if ! command -v lsof >/dev/null 2>&1; then
-        echo "安装 lsof..."
-        if ! apk add --no-cache lsof >/dev/null; then
-            echo "警告：无法安装lsof，端口检查功能可能受限"
-        fi
-    fi
-    
     echo "必要工具已准备就绪"
-}
-
-# 检查端口是否被真正占用（排除TIME_WAIT状态）
-is_port_really_in_use() {
-    local port=$1
-    local in_use=1  # 默认为未占用
-    
-    debug "检查端口 $port 是否被占用..."
-    
-    # 方法1：使用netstat检查，排除TIME_WAIT状态
-    if netstat -tuln | grep -q ":$port "; then
-        debug "netstat 检测到端口 $port 被监听"
-        in_use=0
-    else
-        # 检查是否有TIME_WAIT状态的连接（不视为占用）
-        if netstat - tuln | grep -q ":$port "; then
-            debug "端口 $port 处于TIME_WAIT状态，不视为占用"
-        fi
-    fi
-    
-    # 方法2：使用lsof检查（如果可用），排除LISTEN状态以外的情况
-    if [ $in_use -eq 1 ] && command -v lsof >/dev/null 2>&1; then
-        if lsof -i :$port -sTCP:LISTEN >/dev/null 2>&1; then
-            debug "lsof 检测到端口 $port 被监听"
-            in_use=0
-        fi
-    fi
-    
-    # 方法3：尝试临时绑定端口验证
-    if [ $in_use -eq 1 ]; then
-        debug "尝试临时绑定端口 $port 验证..."
-        if ! socat TCP4-LISTEN:$port,reuseaddr,fork /dev/null >/dev/null 2>&1 & then
-            local temp_pid=$!
-            sleep 1
-            if ps -p $temp_pid >/dev/null 2>&1; then
-                kill $temp_pid >/dev/null 2>&1
-                debug "临时绑定成功，端口 $port 未被占用"
-                in_use=1
-            else
-                debug "临时绑定失败，端口 $port 被占用"
-                in_use=0
-            fi
-        else
-            debug "临时绑定失败，端口 $port 被占用"
-            in_use=0
-        fi
-    fi
-    
-    return $in_use
-}
-
-# 显示端口状态详情（供调试）
-show_port_details() {
-    local port=$1
-    echo "端口 $port 状态详情："
-    
-    echo "1. netstat 结果："
-    netstat -tuln | grep ":$port" || echo "无监听记录"
-    
-    echo -e "\n2. 所有相关连接（包括TIME_WAIT）："
-    netstat -tuln | grep ":$port" || echo "无相关连接"
-    
-    if command -v lsof >/dev/null 2>&1; then
-        echo -e "\n3. lsof 结果："
-        lsof -i :$port || echo "无相关进程"
-    fi
-    
-    echo -e "\n4. 临时绑定测试："
-    if socat TCP4-LISTEN:$port,reuseaddr,fork /dev/null >/dev/null 2>&1 & then
-        local temp_pid=$!
-        sleep 1
-        if ps -p $temp_pid >/dev/null 2>&1; then
-            kill $temp_pid >/dev/null 2>&1
-            echo "成功绑定，端口可用"
-        else
-            echo "绑定失败，端口不可用"
-        fi
-    else
-        echo "绑定失败，端口不可用"
-    fi
-}
-
-# 强制释放端口
-force_release_port() {
-    local port=$1
-    
-    if is_port_really_in_use $port; then
-        echo "尝试强制释放端口 $port..."
-        
-        # 使用lsof查找并杀死占用进程（如果可用）
-        if command -v lsof >/dev/null 2>&1; then
-            local pids=$(lsof -t -i :$port)
-            if [ -n "$pids" ]; then
-                for pid in $pids; do
-                    kill -9 $pid >/dev/null 2>&1
-                    echo "已终止占用端口的进程 PID: $pid"
-                done
-            fi
-        else
-            # 备用方法：使用netstat查找进程
-            local lines=$(netstat -tulnp | grep ":$port ")
-            if [ -n "$lines" ]; then
-                echo "$lines" | while read -r line; do
-                    pid=$(echo "$line" | awk '{print $7}' | cut -d'/' -f1)
-                    if [ -n "$pid" ] && [ "$pid" -ne "-" ]; then
-                        kill -9 $pid >/dev/null 2>&1
-                        echo "已终止占用端口的进程 PID: $pid"
-                    fi
-                done
-            fi
-        fi
-        
-        # 验证释放结果
-        sleep 1
-        if is_port_really_in_use $port; then
-            echo "警告：端口 $port 仍无法释放，请手动检查"
-            return 1
-        else
-            echo "端口 $port 已成功释放"
-            return 0
-        fi
-    else
-        echo "端口 $port 未被占用"
-        return 0
-    fi
 }
 
 # 检查是否为数字
@@ -308,36 +158,11 @@ add_rule() {
         *) echo "无效选项"; return ;;
     esac
     
-    # 输入本地端口（增加手动验证选项）
+    # 输入本地端口（仅验证格式）
     while true; do
         read -p "请输入本地监听端口 [1-65535]: " local_port
         if is_number "$local_port" && [ $local_port -ge 1 ] && [ $local_port -le 65535 ]; then
-            # 检查端口是否已被占用
-            if is_port_really_in_use $local_port; then
-                echo "系统检测到端口 $local_port 被占用"
-                read -p "是否查看端口详情? [y/N]: " confirm
-                if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-                    show_port_details $local_port
-                fi
-                
-                read -p "是否强制忽略检测并继续? [y/N]: " confirm_force
-                if [ "$confirm_force" = "y" ] || [ "$confirm_force" = "Y" ]; then
-                    break
-                else
-                    read -p "是否尝试强制释放该端口? [y/N]: " confirm_release
-                    if [ "$confirm_release" = "y" ] || [ "$confirm_release" = "Y" ]; then
-                        if force_release_port $local_port; then
-                            break
-                        else
-                            echo "请选择其他端口"
-                        fi
-                    else
-                        echo "请选择其他端口"
-                    fi
-                fi
-            else
-                break
-            fi
+            break
         else
             echo "无效的端口号，请重新输入"
         fi
@@ -400,7 +225,7 @@ show_rules() {
     done < $RULES_FILE
 }
 
-# 删除指定规则（增强清理）
+# 删除指定规则
 delete_rule() {
     show_rules
     if [ ! -s $RULES_FILE ]; then
@@ -413,29 +238,18 @@ delete_rule() {
         return
     fi
     
-    # 获取规则详情
-    rule=$(grep "^$rule_id " $RULES_FILE)
-    if [ -z "$rule" ]; then
+    # 检查规则是否存在
+    if ! grep -q "^$rule_id " $RULES_FILE; then
         echo "规则ID $rule_id 不存在"
         return
     fi
     
-    # 提取端口信息用于后续清理
-    local_port=$(echo "$rule" | awk '{print $3}')
-    
-    # 停止并删除规则
+    # 停止该规则的进程
     stop_single_rule $rule_id
+    
+    # 从规则文件中删除
     sed -i "/^$rule_id /d" $RULES_FILE
     echo "规则ID $rule_id 已删除"
-    
-    # 检查并释放端口
-    if is_port_really_in_use $local_port; then
-        echo "检测到端口 $local_port 仍被占用"
-        read -p "是否尝试强制释放该端口? [y/N]: " confirm
-        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-            force_release_port $local_port
-        fi
-    fi
 }
 
 # 清空所有规则
@@ -447,32 +261,18 @@ clear_all_rules() {
     
     read -p "确定要删除所有转发规则吗? [y/N]: " confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        # 记录所有端口用于后续清理
-        local ports=$(awk '{print $3}' $RULES_FILE | sort -u)
-        
         # 停止所有进程
         stop_all_rules
         
         # 清空规则文件
         > $RULES_FILE
         echo "所有规则已清除"
-        
-        # 检查并释放残留端口
-        for port in $ports; do
-            if is_port_really_in_use $port; then
-                echo "检测到端口 $port 仍被占用"
-                read -p "是否尝试强制释放? [y/N]: " confirm
-                if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-                    force_release_port $port
-                fi
-            fi
-        done
     else
         echo "操作已取消"
     fi
 }
 
-# 启动单个规则（增强检查）
+# 启动单个规则（无端口检测）
 start_single_rule() {
     local rule_id=$1
     local rule=$(grep "^$rule_id " $RULES_FILE)
@@ -487,27 +287,18 @@ start_single_rule() {
     remote_host=$(echo "$rule" | awk '{print $4}')
     remote_port=$(echo "$rule" | awk '{print $5}')
     
-    # 启动前再次检查端口
-    if is_port_really_in_use $local_port; then
-        echo "错误：端口 $local_port 已被占用，无法启动转发"
-        read -p "是否查看端口详情? [y/N]: " confirm
-        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-            show_port_details $local_port
-        fi
-        return 1
-    fi
-    
-    # 启动TCP转发
+    # 启动TCP转发（无端口检测）
     if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
         if ! pgrep -F $PID_DIR/socat-tcp-$rule_id.pid >/dev/null 2>&1; then
+            echo "尝试启动 TCP 转发: $local_port -> $remote_host:$remote_port"
             socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_host:$remote_port &
-            echo $! > $PID_DIR/socat-tcp-$rule_id.pid
-            # 验证启动结果
+            local pid=$!
+            echo $pid > $PID_DIR/socat-tcp-$rule_id.pid
+            
+            # 短暂等待后检查是否启动成功
             sleep 1
-            if pgrep -F $PID_DIR/socat-tcp-$rule_id.pid >/dev/null 2>&1; then
-                echo "已启动 TCP 转发: $local_port -> $remote_host:$remote_port"
-            else
-                echo "警告: TCP 转发启动失败"
+            if ! ps -p $pid >/dev/null 2>&1; then
+                echo "TCP 转发启动失败（可能端口被占用或其他错误）"
                 rm -f $PID_DIR/socat-tcp-$rule_id.pid
             fi
         else
@@ -515,17 +306,18 @@ start_single_rule() {
         fi
     fi
     
-    # 启动UDP转发
+    # 启动UDP转发（无端口检测）
     if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
         if ! pgrep -F $PID_DIR/socat-udp-$rule_id.pid >/dev/null 2>&1; then
+            echo "尝试启动 UDP 转发: $local_port -> $remote_host:$remote_port"
             socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_host:$remote_port &
-            echo $! > $PID_DIR/socat-udp-$rule_id.pid
-            # 验证启动结果
+            local pid=$!
+            echo $pid > $PID_DIR/socat-udp-$rule_id.pid
+            
+            # 短暂等待后检查是否启动成功
             sleep 1
-            if pgrep -F $PID_DIR/socat-udp-$rule_id.pid >/dev/null 2>&1; then
-                echo "已启动 UDP 转发: $local_port -> $remote_host:$remote_port"
-            else
-                echo "警告: UDP 转发启动失败"
+            if ! ps -p $pid >/dev/null 2>&1; then
+                echo "UDP 转发启动失败（可能端口被占用或其他错误）"
                 rm -f $PID_DIR/socat-udp-$rule_id.pid
             fi
         else
@@ -534,7 +326,7 @@ start_single_rule() {
     fi
 }
 
-# 停止单个规则（强制终止）
+# 停止单个规则
 stop_single_rule() {
     local rule_id=$1
     
@@ -542,7 +334,7 @@ stop_single_rule() {
     if [ -f $PID_DIR/socat-tcp-$rule_id.pid ]; then
         pid=$(cat $PID_DIR/socat-tcp-$rule_id.pid)
         if ps -p $pid >/dev/null 2>&1; then
-            kill -9 $pid >/dev/null 2>&1  # 使用强制终止
+            kill -9 $pid >/dev/null 2>&1
             echo "已停止 TCP 转发 (ID: $rule_id)"
         fi
         rm -f $PID_DIR/socat-tcp-$rule_id.pid
@@ -552,7 +344,7 @@ stop_single_rule() {
     if [ -f $PID_DIR/socat-udp-$rule_id.pid ]; then
         pid=$(cat $PID_DIR/socat-udp-$rule_id.pid)
         if ps -p $pid >/dev/null 2>&1; then
-            kill -9 $pid >/dev/null 2>&1  # 使用强制终止
+            kill -9 $pid >/dev/null 2>&1
             echo "已停止 UDP 转发 (ID: $rule_id)"
         fi
         rm -f $PID_DIR/socat-udp-$rule_id.pid
@@ -574,33 +366,22 @@ start_all_rules() {
     done < $RULES_FILE
 }
 
-# 停止所有规则（强制终止）
+# 停止所有规则
 stop_all_rules() {
     # 停止所有转发进程
     for pidfile in $PID_DIR/*.pid; do
         if [ -f "$pidfile" ]; then
             pid=$(cat "$pidfile")
             if ps -p $pid >/dev/null 2>&1; then
-                kill -9 $pid >/dev/null 2>&1  # 使用强制终止
+                kill -9 $pid >/dev/null 2>&1
                 echo "已停止转发进程 (PID: $pid)"
             fi
             rm -f "$pidfile"
         fi
     done
     
-    # 额外清理所有可能残留的socat进程
+    # 清理残留的socat进程
     pkill -9 -f "socat (TCP4|UDP4)-LISTEN" >/dev/null 2>&1
-}
-
-# 切换调试模式
-toggle_debug() {
-    if [ $DEBUG_MODE -eq 0 ]; then
-        DEBUG_MODE=1
-        echo "已开启调试模式"
-    else
-        DEBUG_MODE=0
-        echo "已关闭调试模式"
-    fi
 }
 
 # 设置开机启动
@@ -632,7 +413,7 @@ show_menu() {
     clear
     echo "======================================"
     echo "      Socat 端口转发管理工具          "
-    echo "           Alpine Linux 版            "
+    echo "           简化版 (无端口检测)        "
     echo "======================================"
     echo "1. 添加新转发规则"
     echo "2. 查看所有转发规则 (含状态)"
@@ -645,11 +426,10 @@ show_menu() {
     echo "--------------------------------------"
     echo "8. 设置开机自启动"
     echo "9. 取消开机自启动"
-    echo "10. $(if [ $DEBUG_MODE -eq 0 ]; then echo "开启"; else echo "关闭"; fi)调试模式"
     echo "--------------------------------------"
     echo "0. 退出"
     echo "======================================"
-    read -p "请输入操作选项 [0-10]: " choice
+    read -p "请输入操作选项 [0-9]: " choice
 }
 
 # 主程序
@@ -674,7 +454,6 @@ main() {
             7) stop_all_rules; start_all_rules ;;
             8) enable_boot_start ;;
             9) disable_boot_start ;;
-            10) toggle_debug ;;
             0) echo "再见!"; exit 0 ;;
             *) echo "无效选项，请重新输入" ;;
         esac
