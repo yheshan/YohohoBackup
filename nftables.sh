@@ -1,6 +1,5 @@
 #!/bin/bash
-# 功能：nftables 端口转发管理（支持TCP/UDP/TCP+UDP）
-# 特点：IP:端口直显、协议可选、极简删除
+# 功能：nftables 端口转发管理（修复显示问题 + 极简删除）
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -61,10 +60,9 @@ forward() {
 
 show_rules() {
     echo -e "\n${BLUE}=== 当前 nftables 规则 ===${NC}"
-    nft list table ip nat 2>/dev/null | grep -A2 "dnat to" | awk '{
-        if ($0 ~ /tcp|udp/) { proto=$1 }
-        if ($0 ~ /dport/) { port=$2 }
-        if ($0 ~ /dnat to/) { split($3, target, ":"); ip=target[1]; port_dst=target[2] }
+    nft list table ip nat 2>/dev/null | grep -E "tcp dport|udp dport" -A1 | awk '{
+        if ($0 ~ /tcp|udp/) { proto=$1; port=$3 }
+        if ($0 ~ /dnat/) { split($4, target, ":"); ip=target[1]; port_dst=target[2] }
         if (proto && port && ip && port_dst) {
             printf "  %s %s -> %s:%s\n", proto, port, ip, port_dst
         }
@@ -74,7 +72,11 @@ show_rules() {
 delete_rule() {
     show_rules
     read -p "输入要删除的规则行号: " NUM
-    HANDLE=$(nft -a list chain ip nat prerouting | awk -v line=$((NUM*3-1)) 'NR==line{print $NF}')
+    HANDLE=$(nft -a list chain ip nat prerouting | grep -n "dnat" | awk -F: -v line=$NUM 'NR==line{print $2}' | awk '{print $NF}')
+    [ -z "$HANDLE" ] && {
+        echo -e "${RED}删除失败，请检查行号！${NC}"
+        return
+    }
     nft delete rule ip nat prerouting handle $HANDLE
     nftables_save
     echo -e "${GREEN}规则已删除！${NC}"
