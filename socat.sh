@@ -1,36 +1,31 @@
 #!/bin/sh
-# Socat端口转发一键管理脚本 (Alpine Linux专用) - 完全兼容版
-# 支持TCP/UDP协议，规则持久化，多端口转发
+# Socat端口转发一键管理脚本 (Alpine Linux专用) - 端口占用修复版
+# 解决端口占用、规则状态异常和删除后无法重新添加的问题
 
 # 配置变量
 RULES_FILE="/etc/socat-rules.conf"
 SERVICE_FILE="/etc/init.d/socat-forward"
 PID_DIR="/var/run/socat"
-SCRIPT_PATH=$(readlink -f "$0")  # 获取当前脚本的绝对路径
+SCRIPT_PATH=$(readlink -f "$0")
 
-# 确保必要目录和文件存在
+# 初始化环境
 init_env() {
-    # 创建PID目录
     mkdir -p $PID_DIR
     chmod 755 $PID_DIR
     
-    # 创建规则文件
     if [ ! -f $RULES_FILE ]; then
         touch $RULES_FILE
         chmod 644 $RULES_FILE
     fi
     
-    # 创建服务文件
     create_service_file
 }
 
-# 创建系统服务文件
+# 创建服务文件
 create_service_file() {
     if [ ! -f $SERVICE_FILE ]; then
         cat > $SERVICE_FILE << EOF
 #!/sbin/openrc-run
-# 提供socat转发服务的openrc服务脚本
-
 RULES_FILE="$RULES_FILE"
 PID_DIR="$PID_DIR"
 SCRIPT_PATH="$SCRIPT_PATH"
@@ -42,20 +37,13 @@ depend() {
 
 start() {
     ebegin "Starting socat forward services"
-    
-    # 确保PID目录存在
     mkdir -p \$PID_DIR
-    chmod 755 \$PID_DIR
-    
-    # 启动所有规则
     \$SCRIPT_PATH --start-all
     eend \$?
 }
 
 stop() {
     ebegin "Stopping socat forward services"
-    
-    # 停止所有规则
     \$SCRIPT_PATH --stop-all
     eend \$?
 }
@@ -66,16 +54,15 @@ restart() {
 }
 EOF
         chmod 755 $SERVICE_FILE
-        # 确保服务脚本有执行权限
         chmod +x $SERVICE_FILE
     fi
 }
 
-# 安装必要工具（完全兼容ash语法）
+# 安装必要工具
 install_dependencies() {
     echo "正在检查并安装必要工具..."
     
-    # 检查并安装socat
+    # 安装socat
     if ! command -v socat >/dev/null 2>&1; then
         echo "安装 socat..."
         if ! apk add --no-cache socat >/dev/null; then
@@ -84,33 +71,104 @@ install_dependencies() {
         fi
     fi
     
-    # 检查并安装net-tools（包含netstat）
+    # 安装net-tools（含netstat）
     if ! command -v netstat >/dev/null 2>&1; then
-        echo "安装 net-tools (包含netstat)..."
+        echo "安装 net-tools..."
         if ! apk add --no-cache net-tools >/dev/null; then
             echo "错误：无法安装net-tools，请检查网络"
             exit 1
         fi
     fi
     
+    # 安装lsof用于更精确的端口占用检查
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "安装 lsof..."
+        if ! apk add --no-cache lsof >/dev/null; then
+            echo "警告：无法安装lsof，端口检查功能可能受限"
+        fi
+    fi
+    
     echo "必要工具已准备就绪"
 }
 
-# 检查端口是否被占用（使用netstat）
+# 检查端口是否被占用（增强版）
 is_port_in_use() {
     local port=$1
-    # 检查TCP和UDP端口是否被占用
+    local in_use=1  # 默认为未占用
+    
+    # 方法1：使用netstat检查
     if netstat -tuln | grep -q ":$port "; then
-        return 0  # 端口已占用
+        in_use=0
+    # 方法2：使用lsof检查（如果可用）
+    elif command -v lsof >/dev/null 2>&1; then
+        if lsof -i :$port >/dev/null 2>&1; then
+            in_use=0
+        fi
+    fi
+    
+    return $in_use
+}
+
+# 显示占用端口的进程信息
+show_port_owner() {
+    local port=$1
+    echo "端口 $port 被以下进程占用："
+    
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -i :$port | grep -v "COMMAND"
     else
-        return 1  # 端口未占用
+        netstat -tulnp | grep ":$port "
+    fi
+}
+
+# 强制释放端口
+force_release_port() {
+    local port=$1
+    
+    if is_port_in_use $port; then
+        echo "尝试强制释放端口 $port..."
+        
+        # 使用lsof查找并杀死占用进程（如果可用）
+        if command -v lsof >/dev/null 2>&1; then
+            local pids=$(lsof -t -i :$port)
+            if [ -n "$pids" ]; then
+                for pid in $pids; do
+                    kill -9 $pid >/dev/null 2>&1
+                    echo "已终止占用端口的进程 PID: $pid"
+                done
+            fi
+        else
+            # 备用方法：使用netstat查找进程
+            local lines=$(netstat -tulnp | grep ":$port ")
+            if [ -n "$lines" ]; then
+                echo "$lines" | while read -r line; do
+                    pid=$(echo "$line" | awk '{print $7}' | cut -d'/' -f1)
+                    if [ -n "$pid" ] && [ "$pid" -ne "-" ]; then
+                        kill -9 $pid >/dev/null 2>&1
+                        echo "已终止占用端口的进程 PID: $pid"
+                    fi
+                done
+            fi
+        fi
+        
+        # 验证释放结果
+        sleep 1
+        if is_port_in_use $port; then
+            echo "警告：端口 $port 仍无法释放，请手动检查"
+            return 1
+        else
+            echo "端口 $port 已成功释放"
+            return 0
+        fi
+    else
+        echo "端口 $port 未被占用"
+        return 0
     fi
 }
 
 # 检查是否为数字
 is_number() {
     local str=$1
-    # 使用grep检查是否为纯数字
     echo "$str" | grep -q '^[0-9]\+$'
     return $?
 }
@@ -140,7 +198,6 @@ check_rule_status() {
             if ps -p $pid >/dev/null 2>&1; then
                 tcp_running=1
             else
-                # 清理无效PID文件
                 rm -f "$PID_DIR/socat-tcp-$rule_id.pid"
             fi
         fi
@@ -153,7 +210,6 @@ check_rule_status() {
             if ps -p $pid >/dev/null 2>&1; then
                 udp_running=1
             else
-                # 清理无效PID文件
                 rm -f "$PID_DIR/socat-udp-$rule_id.pid"
             fi
         fi
@@ -161,18 +217,10 @@ check_rule_status() {
     
     # 返回状态文本
     if [ "$proto" = "tcp" ]; then
-        if [ $tcp_running -eq 1 ]; then
-            echo "运行中"
-        else
-            echo "已停止"
-        fi
+        [ $tcp_running -eq 1 ] && echo "运行中" || echo "已停止"
     elif [ "$proto" = "udp" ]; then
-        if [ $udp_running -eq 1 ]; then
-            echo "运行中"
-        else
-            echo "已停止"
-        fi
-    else # both
+        [ $udp_running -eq 1 ] && echo "运行中" || echo "已停止"
+    else
         if [ $tcp_running -eq 1 ] && [ $udp_running -eq 1 ]; then
             echo "全部运行"
         elif [ $tcp_running -eq 1 ] || [ $udp_running -eq 1 ]; then
@@ -202,14 +250,23 @@ add_rule() {
         *) echo "无效选项"; return ;;
     esac
     
-    # 输入本地端口
+    # 输入本地端口（增加强制释放选项）
     while true; do
         read -p "请输入本地监听端口 [1-65535]: " local_port
-        # 使用ash兼容的方式检查是否为数字
         if is_number "$local_port" && [ $local_port -ge 1 ] && [ $local_port -le 65535 ]; then
             # 检查端口是否已被占用
             if is_port_in_use $local_port; then
-                echo "端口 $local_port 已被占用，请选择其他端口"
+                show_port_owner $local_port
+                read -p "端口已被占用，是否尝试强制释放? [y/N]: " confirm
+                if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+                    if force_release_port $local_port; then
+                        break
+                    else
+                        echo "请选择其他端口"
+                    fi
+                else
+                    echo "请选择其他端口"
+                fi
             else
                 break
             fi
@@ -228,7 +285,6 @@ add_rule() {
     # 输入远程端口
     while true; do
         read -p "请输入远程端口 [1-65535]: " remote_port
-        # 使用ash兼容的方式检查是否为数字
         if is_number "$remote_port" && [ $remote_port -ge 1 ] && [ $remote_port -le 65535 ]; then
             break
         else
@@ -236,12 +292,12 @@ add_rule() {
         fi
     done
     
-    # 获取规则ID并添加到文件
+    # 添加并启动规则
     rule_id=$(get_next_id)
     echo "$rule_id $proto $local_port $remote_host $remote_port" >> $RULES_FILE
     echo "规则添加成功 (ID: $rule_id)"
     
-    # 立即启动该规则
+    # 尝试启动规则
     start_single_rule $rule_id
 }
 
@@ -257,7 +313,6 @@ show_rules() {
     fi
     
     while IFS= read -r rule; do
-        # 跳过空行和注释
         [ -z "$rule" ] || [ "${rule#\#}" != "$rule" ] && continue
         
         id=$(echo "$rule" | awk '{print $1}')
@@ -266,21 +321,18 @@ show_rules() {
         remote_host=$(echo "$rule" | awk '{print $4}')
         remote_port=$(echo "$rule" | awk '{print $5}')
         
-        # 格式化协议显示
         case $proto in
             tcp) proto_display="TCP       " ;;
             udp) proto_display="UDP       " ;;
             both) proto_display="TCP+UDP   " ;;
         esac
         
-        # 获取状态
         status=$(check_rule_status $id $proto)
-        
         echo "$id   $proto_display $status   $local_port -> $remote_host:$remote_port"
     done < $RULES_FILE
 }
 
-# 删除指定规则
+# 删除指定规则（增强清理）
 delete_rule() {
     show_rules
     if [ ! -s $RULES_FILE ]; then
@@ -293,18 +345,29 @@ delete_rule() {
         return
     fi
     
-    # 检查规则是否存在
-    if ! grep -q "^$rule_id " $RULES_FILE; then
+    # 获取规则详情
+    rule=$(grep "^$rule_id " $RULES_FILE)
+    if [ -z "$rule" ]; then
         echo "规则ID $rule_id 不存在"
         return
     fi
     
-    # 停止该规则的进程
-    stop_single_rule $rule_id
+    # 提取端口信息用于后续清理
+    local_port=$(echo "$rule" | awk '{print $3}')
     
-    # 从规则文件中删除
+    # 停止并删除规则
+    stop_single_rule $rule_id
     sed -i "/^$rule_id /d" $RULES_FILE
     echo "规则ID $rule_id 已删除"
+    
+    # 检查并释放端口
+    if is_port_in_use $local_port; then
+        echo "检测到端口 $local_port 仍被占用"
+        read -p "是否尝试强制释放该端口? [y/N]: " confirm
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+            force_release_port $local_port
+        fi
+    fi
 }
 
 # 清空所有规则
@@ -316,18 +379,32 @@ clear_all_rules() {
     
     read -p "确定要删除所有转发规则吗? [y/N]: " confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        # 记录所有端口用于后续清理
+        local ports=$(awk '{print $3}' $RULES_FILE | sort -u)
+        
         # 停止所有进程
         stop_all_rules
         
         # 清空规则文件
         > $RULES_FILE
         echo "所有规则已清除"
+        
+        # 检查并释放残留端口
+        for port in $ports; do
+            if is_port_in_use $port; then
+                echo "检测到端口 $port 仍被占用"
+                read -p "是否尝试强制释放? [y/N]: " confirm
+                if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+                    force_release_port $port
+                fi
+            fi
+        done
     else
         echo "操作已取消"
     fi
 }
 
-# 启动单个规则
+# 启动单个规则（增强检查）
 start_single_rule() {
     local rule_id=$1
     local rule=$(grep "^$rule_id " $RULES_FILE)
@@ -342,16 +419,25 @@ start_single_rule() {
     remote_host=$(echo "$rule" | awk '{print $4}')
     remote_port=$(echo "$rule" | awk '{print $5}')
     
+    # 启动前再次检查端口
+    if is_port_in_use $local_port; then
+        echo "错误：端口 $local_port 已被占用，无法启动转发"
+        show_port_owner $local_port
+        return 1
+    fi
+    
     # 启动TCP转发
     if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
         if ! pgrep -F $PID_DIR/socat-tcp-$rule_id.pid >/dev/null 2>&1; then
-            # 检查端口是否已被占用
-            if is_port_in_use $local_port; then
-                echo "警告: 端口 $local_port 已被占用，TCP转发启动失败"
-            else
-                socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_host:$remote_port &
-                echo $! > $PID_DIR/socat-tcp-$rule_id.pid
+            socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_host:$remote_port &
+            echo $! > $PID_DIR/socat-tcp-$rule_id.pid
+            # 验证启动结果
+            sleep 1
+            if pgrep -F $PID_DIR/socat-tcp-$rule_id.pid >/dev/null 2>&1; then
                 echo "已启动 TCP 转发: $local_port -> $remote_host:$remote_port"
+            else
+                echo "警告: TCP 转发启动失败"
+                rm -f $PID_DIR/socat-tcp-$rule_id.pid
             fi
         else
             echo "TCP 转发 $local_port -> $remote_host:$remote_port 已在运行"
@@ -361,13 +447,15 @@ start_single_rule() {
     # 启动UDP转发
     if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
         if ! pgrep -F $PID_DIR/socat-udp-$rule_id.pid >/dev/null 2>&1; then
-            # 检查端口是否已被占用
-            if is_port_in_use $local_port; then
-                echo "警告: 端口 $local_port 已被占用，UDP转发启动失败"
-            else
-                socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_host:$remote_port &
-                echo $! > $PID_DIR/socat-udp-$rule_id.pid
+            socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_host:$remote_port &
+            echo $! > $PID_DIR/socat-udp-$rule_id.pid
+            # 验证启动结果
+            sleep 1
+            if pgrep -F $PID_DIR/socat-udp-$rule_id.pid >/dev/null 2>&1; then
                 echo "已启动 UDP 转发: $local_port -> $remote_host:$remote_port"
+            else
+                echo "警告: UDP 转发启动失败"
+                rm -f $PID_DIR/socat-udp-$rule_id.pid
             fi
         else
             echo "UDP 转发 $local_port -> $remote_host:$remote_port 已在运行"
@@ -375,7 +463,7 @@ start_single_rule() {
     fi
 }
 
-# 停止单个规则
+# 停止单个规则（强制终止）
 stop_single_rule() {
     local rule_id=$1
     
@@ -383,7 +471,7 @@ stop_single_rule() {
     if [ -f $PID_DIR/socat-tcp-$rule_id.pid ]; then
         pid=$(cat $PID_DIR/socat-tcp-$rule_id.pid)
         if ps -p $pid >/dev/null 2>&1; then
-            kill $pid >/dev/null 2>&1
+            kill -9 $pid >/dev/null 2>&1  # 使用强制终止
             echo "已停止 TCP 转发 (ID: $rule_id)"
         fi
         rm -f $PID_DIR/socat-tcp-$rule_id.pid
@@ -393,14 +481,14 @@ stop_single_rule() {
     if [ -f $PID_DIR/socat-udp-$rule_id.pid ]; then
         pid=$(cat $PID_DIR/socat-udp-$rule_id.pid)
         if ps -p $pid >/dev/null 2>&1; then
-            kill $pid >/dev/null 2>&1
+            kill -9 $pid >/dev/null 2>&1  # 使用强制终止
             echo "已停止 UDP 转发 (ID: $rule_id)"
         fi
         rm -f $PID_DIR/socat-udp-$rule_id.pid
     fi
 }
 
-# 启动所有规则（供服务调用）
+# 启动所有规则
 start_all_rules() {
     if [ ! -s $RULES_FILE ]; then
         echo "没有转发规则可启动"
@@ -408,7 +496,6 @@ start_all_rules() {
     fi
     
     while IFS= read -r rule; do
-        # 跳过空行和注释
         [ -z "$rule" ] || [ "${rule#\#}" != "$rule" ] && continue
         
         id=$(echo "$rule" | awk '{print $1}')
@@ -416,31 +503,28 @@ start_all_rules() {
     done < $RULES_FILE
 }
 
-# 停止所有规则（供服务调用）
+# 停止所有规则（强制终止）
 stop_all_rules() {
     # 停止所有转发进程
     for pidfile in $PID_DIR/*.pid; do
         if [ -f "$pidfile" ]; then
             pid=$(cat "$pidfile")
             if ps -p $pid >/dev/null 2>&1; then
-                kill $pid >/dev/null 2>&1
+                kill -9 $pid >/dev/null 2>&1  # 使用强制终止
                 echo "已停止转发进程 (PID: $pid)"
             fi
             rm -f "$pidfile"
         fi
     done
     
-    # 额外安全检查：终止所有可能残留的socat进程
-    pkill -f "socat (TCP4|UDP4)-LISTEN" >/dev/null 2>&1
+    # 额外清理所有可能残留的socat进程
+    pkill -9 -f "socat (TCP4|UDP4)-LISTEN" >/dev/null 2>&1
 }
 
 # 设置开机启动
 enable_boot_start() {
-    # 先删除可能存在的旧配置
     rc-update del socat-forward default >/dev/null 2>&1
-    # 添加新配置
     rc-update add socat-forward default
-    # 保存配置
     rc-update -u
     echo "已设置 socat 转发服务开机自启"
 }
@@ -452,7 +536,7 @@ disable_boot_start() {
     echo "已取消 socat 转发服务开机自启"
 }
 
-# 命令行参数处理（供服务调用）
+# 命令行参数处理
 if [ "$1" = "--start-all" ]; then
     start_all_rules
     exit 0
@@ -487,19 +571,14 @@ show_menu() {
 
 # 主程序
 main() {
-    # 检查是否以root权限运行
     if [ "$(id -u)" -ne 0 ]; then
         echo "错误: 此脚本需要以root权限运行"
         exit 1
     fi
     
-    # 初始化环境
     init_env
-    
-    # 安装必要依赖
     install_dependencies
     
-    # 主循环
     while true; do
         show_menu
         case $choice in
@@ -520,5 +599,4 @@ main() {
     done
 }
 
-# 启动主程序
 main
