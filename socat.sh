@@ -1,10 +1,11 @@
 #!/bin/bash
-# Socat端口转发一键管理脚本
+# Socat端口转发一键管理脚本（兼容所有Linux系统）
 # 支持TCP、UDP协议，多端口转发，开机自启，规则管理
 
-# 配置文件路径
+# 配置文件和PID文件路径
 CONFIG_FILE="/etc/socat-forward.conf"
-SYSTEMD_SERVICE="/etc/systemd/system/socat-forward@.service"
+PID_DIR="/var/run/socat-forward"
+RC_LOCAL="/etc/rc.local"
 
 # 检查socat是否安装
 check_socat() {
@@ -23,32 +24,38 @@ check_socat() {
     fi
 }
 
-# 检查并创建配置文件
-check_config() {
+# 初始化必要文件和目录
+initialize() {
+    # 创建配置文件
     if [ ! -f "$CONFIG_FILE" ]; then
         touch "$CONFIG_FILE"
         chmod 600 "$CONFIG_FILE"
     fi
+    
+    # 创建PID目录
+    if [ ! -d "$PID_DIR" ]; then
+        mkdir -p "$PID_DIR"
+        chmod 700 "$PID_DIR"
+    fi
+    
+    # 配置开机自启
+    setup_autostart
 }
 
-# 创建systemd服务文件
-create_service() {
-    if [ ! -f "$SYSTEMD_SERVICE" ]; then
-        cat > "$SYSTEMD_SERVICE" << EOF
-[Unit]
-Description=Socat port forwarding instance %I
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/socat %I
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
+# 配置开机自启
+setup_autostart() {
+    # 创建rc.local如果不存在
+    if [ ! -f "$RC_LOCAL" ]; then
+        echo "#!/bin/sh -e" > "$RC_LOCAL"
+        echo "exit 0" >> "$RC_LOCAL"
+        chmod +x "$RC_LOCAL"
+    fi
+    
+    # 检查是否已添加自启动命令
+    if ! grep -q "$0 start_all" "$RC_LOCAL"; then
+        # 在exit 0之前插入启动命令
+        sed -i '/exit 0/i '"$0 start_all &" "$RC_LOCAL"
+        echo "已配置开机自启"
     fi
 }
 
@@ -109,24 +116,60 @@ add_rule() {
     # 生成规则ID
     rule_id="$(date +%s)_${local_port}_${remote_ip}_${remote_port}"
     
-    # 添加规则到配置文件
+    # 添加规则到配置文件并启动
     for proto in "${protos[@]}"; do
         # Socat命令格式
         if [ "$proto" = "tcp" ]; then
-            cmd="TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_ip:$remote_port"
+            cmd="socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_ip:$remote_port"
         else
-            cmd="UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_ip:$remote_port"
+            cmd="socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_ip:$remote_port"
         fi
         
         # 写入配置文件
         echo "$rule_id|$proto|$local_port|$remote_ip|$remote_port|$cmd" >> "$CONFIG_FILE"
         
-        # 启动服务并设置开机自启
-        systemctl start socat-forward@"$(systemd-escape "$cmd")".service
-        systemctl enable socat-forward@"$(systemd-escape "$cmd")".service
-        
+        # 启动转发进程
+        start_process "$rule_id" "$cmd"
         echo "已添加并启动 $proto 转发规则: $local_port -> $remote_ip:$remote_port"
     done
+}
+
+# 启动进程
+start_process() {
+    local rule_id=$1
+    local cmd=$2
+    local pid_file="$PID_DIR/$rule_id.pid"
+    
+    # 检查是否已在运行
+    if [ -f "$pid_file" ]; then
+        local pid=$(cat "$pid_file")
+        if ps -p $pid &> /dev/null; then
+            return 0
+        fi
+    fi
+    
+    # 启动进程并保存PID
+    $cmd > /dev/null 2>&1 &
+    echo $! > "$pid_file"
+}
+
+# 停止进程
+stop_process() {
+    local rule_id=$1
+    local pid_file="$PID_DIR/$rule_id.pid"
+    
+    if [ -f "$pid_file" ]; then
+        local pid=$(cat "$pid_file")
+        if ps -p $pid &> /dev/null; then
+            kill $pid
+            sleep 1
+            # 强制杀死残留进程
+            if ps -p $pid &> /dev/null; then
+                kill -9 $pid
+            fi
+        fi
+        rm -f "$pid_file"
+    fi
 }
 
 # 查看所有规则
@@ -143,10 +186,15 @@ list_rules() {
     while IFS='|' read -r rule_id proto local_port remote_ip remote_port cmd; do
         if [ -z "$rule_id" ]; then continue; fi
         
-        # 检查服务状态
-        escaped_cmd=$(systemd-escape "$cmd")
-        if systemctl is-active --quiet socat-forward@"$escaped_cmd".service; then
-            status="运行中"
+        # 检查进程状态
+        pid_file="$PID_DIR/$rule_id.pid"
+        if [ -f "$pid_file" ]; then
+            pid=$(cat "$pid_file")
+            if ps -p $pid &> /dev/null; then
+                status="运行中 (PID: $pid)"
+            else
+                status="已停止 (残留PID文件)"
+            fi
         else
             status="已停止"
         fi
@@ -163,9 +211,7 @@ start_rule() {
     found=0
     while IFS='|' read -r rule_id proto local_port remote_ip remote_port cmd; do
         if [ "$rule_id" = "$target_id" ]; then
-            escaped_cmd=$(systemd-escape "$cmd")
-            systemctl start socat-forward@"$escaped_cmd".service
-            systemctl enable socat-forward@"$escaped_cmd".service
+            start_process "$rule_id" "$cmd"
             echo "已启动规则 $rule_id: $proto $local_port -> $remote_ip:$remote_port"
             found=1
         fi
@@ -184,9 +230,7 @@ stop_rule() {
     found=0
     while IFS='|' read -r rule_id proto local_port remote_ip remote_port cmd; do
         if [ "$rule_id" = "$target_id" ]; then
-            escaped_cmd=$(systemd-escape "$cmd")
-            systemctl stop socat-forward@"$escaped_cmd".service
-            systemctl disable socat-forward@"$escaped_cmd".service
+            stop_process "$rule_id"
             echo "已停止规则 $rule_id: $proto $local_port -> $remote_ip:$remote_port"
             found=1
         fi
@@ -205,8 +249,9 @@ restart_rule() {
     found=0
     while IFS='|' read -r rule_id proto local_port remote_ip remote_port cmd; do
         if [ "$rule_id" = "$target_id" ]; then
-            escaped_cmd=$(systemd-escape "$cmd")
-            systemctl restart socat-forward@"$escaped_cmd".service
+            stop_process "$rule_id"
+            sleep 1
+            start_process "$rule_id" "$cmd"
             echo "已重启规则 $rule_id: $proto $local_port -> $remote_ip:$remote_port"
             found=1
         fi
@@ -227,9 +272,7 @@ delete_rule() {
     
     while IFS='|' read -r rule_id proto local_port remote_ip remote_port cmd; do
         if [ "$rule_id" = "$target_id" ]; then
-            escaped_cmd=$(systemd-escape "$cmd")
-            systemctl stop socat-forward@"$escaped_cmd".service
-            systemctl disable socat-forward@"$escaped_cmd".service
+            stop_process "$rule_id"
             echo "已删除规则 $rule_id: $proto $local_port -> $remote_ip:$remote_port"
             found=1
         else
@@ -250,9 +293,7 @@ start_all() {
     while IFS='|' read -r rule_id proto local_port remote_ip remote_port cmd; do
         if [ -z "$rule_id" ]; then continue; fi
         
-        escaped_cmd=$(systemd-escape "$cmd")
-        systemctl start socat-forward@"$escaped_cmd".service
-        systemctl enable socat-forward@"$escaped_cmd".service
+        start_process "$rule_id" "$cmd"
         echo "已启动规则 $rule_id: $proto $local_port -> $remote_ip:$remote_port"
     done < "$CONFIG_FILE"
     echo "所有规则启动完成"
@@ -264,9 +305,7 @@ stop_all() {
     while IFS='|' read -r rule_id proto local_port remote_ip remote_port cmd; do
         if [ -z "$rule_id" ]; then continue; fi
         
-        escaped_cmd=$(systemd-escape "$cmd")
-        systemctl stop socat-forward@"$escaped_cmd".service
-        systemctl disable socat-forward@"$escaped_cmd".service
+        stop_process "$rule_id"
         echo "已停止规则 $rule_id: $proto $local_port -> $remote_ip:$remote_port"
     done < "$CONFIG_FILE"
     echo "所有规则停止完成"
@@ -278,8 +317,9 @@ restart_all() {
     while IFS='|' read -r rule_id proto local_port remote_ip remote_port cmd; do
         if [ -z "$rule_id" ]; then continue; fi
         
-        escaped_cmd=$(systemd-escape "$cmd")
-        systemctl restart socat-forward@"$escaped_cmd".service
+        stop_process "$rule_id"
+        sleep 1
+        start_process "$rule_id" "$cmd"
         echo "已重启规则 $rule_id: $proto $local_port -> $remote_ip:$remote_port"
     done < "$CONFIG_FILE"
     echo "所有规则重启完成"
@@ -289,13 +329,10 @@ restart_all() {
 clear_all() {
     read -p "确定要删除所有规则吗? [y/N] " confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        # 停止所有服务
+        # 停止所有进程
         while IFS='|' read -r rule_id proto local_port remote_ip remote_port cmd; do
             if [ -z "$rule_id" ]; then continue; fi
-            
-            escaped_cmd=$(systemd-escape "$cmd")
-            systemctl stop socat-forward@"$escaped_cmd".service
-            systemctl disable socat-forward@"$escaped_cmd".service
+            stop_process "$rule_id"
         done < "$CONFIG_FILE"
         
         # 清空配置文件
@@ -308,11 +345,24 @@ clear_all() {
 
 # 主程序
 main() {
-    # 初始化检查
-    check_socat
-    check_config
-    create_service
+    # 检查是否以root权限运行
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "请以root权限运行此脚本" >&2
+        exit 1
+    fi
     
+    # 初始化
+    check_socat
+    initialize
+    
+    # 处理命令行参数（用于开机自启）
+    if [ $# -eq 1 ]; then
+        case "$1" in
+            start_all) start_all; exit 0 ;;
+        esac
+    fi
+    
+    # 交互菜单
     while true; do
         show_menu
         case $choice in
@@ -334,4 +384,4 @@ main() {
 }
 
 # 启动主程序
-main
+main "$@"
