@@ -1,6 +1,6 @@
 #!/bin/sh
-# Socat 端口转发发管理脚本
-# 支持 TCP/UDP/加密隧道 转发，自动开机启动，多规则管理
+# Socat 端口转发管理脚本 (数字选择版)
+# 支持 TCP/UDP/加密隧道，自动后台运行和开机启动
 
 # 配置存储路径
 CONFIG_DIR="/etc/socat-forward"
@@ -9,206 +9,248 @@ RULES_FILE="$CONFIG_DIR/rules.conf"
 
 # 初始化环境
 init_env() {
-    # 安装必要组件
-    if ! command -v socat &> /dev/null; then
-        echo "正在安装 socat..."
-        apk add --no-cache socat
-    fi
+    # 安装必要工具
+    apk add --no-cache socat openssl psmisc >/dev/null 2>&1
     
-    # 创建配置目录
+    # 创建配置目录和规则文件
     mkdir -p $CONFIG_DIR
-    touch $RULES_FILE
+    [ -f "$RULES_FILE" ] || touch "$RULES_FILE"
     
-    # 创建服务文件
-    if [ ! -f $SERVICE_FILE ]; then
-        cat > $SERVICE_FILE << EOF
+    # 创建服务文件（OpenRC）
+    if [ ! -f "$SERVICE_FILE" ]; then
+        cat > "$SERVICE_FILE" << 'EOF'
 #!/sbin/openrc-run
-description="Socat port forwarding service"
-command="/bin/sh"
-command_args="$0 start"
-pidfile="/var/run/socat-forward.pid"
+# 开机启动 socat 转发规则
+
+depend() {
+    need net
+    after firewall
+}
+
+start() {
+    ebegin "Starting socat forward rules"
+    /etc/socat-forward/rules.conf start >/dev/null 2>&1
+    eend $?
+}
+
+stop() {
+    ebegin "Stopping socat forward rules"
+    /etc/socat-forward/rules.conf stop >/dev/null 2>&1
+    eend $?
+}
 EOF
-        chmod +x $SERVICE_FILE
-        rc-update add socat-forward default
-        echo "已配置开机启动"
+        chmod +x "$SERVICE_FILE"
+        rc-update add socat-forward default >/dev/null 2>&1
     fi
 }
 
-# 添加转发规则
+# 显示当前规则
+show_rules() {
+    echo -e "\n===== 当前转发规则 ====="
+    if [ -s "$RULES_FILE" ]; then
+        grep -vE '^$|^#' "$RULES_FILE" | nl -w2 -s') '
+    else
+        echo "没有配置任何转发规则"
+    fi
+    echo "=========================="
+}
+
+# 添加新规则
 add_rule() {
-    echo "===== 添加新转发规则 ====="
-    read -p "请输入本地端口: " local_port
-    read -p "请输入目标IP: " target_ip
-    read -p "请输入目标端口: " target_port
+    echo -e "\n----- 添加新转发规则 -----"
     
-    echo "协议选项: "
-    echo "1. TCP (默认)"
-    echo "2. UDP"
-    echo "3. TCP+UDP"
-    echo "4. 加密隧道 (TCP+SSL)"
-    read -p "请选择协议(1-4): " proto_choice
+    # 选择协议类型
+    echo "1) TCP"
+    echo "2) UDP"
+    echo "3) TCP+UDP"
+    echo "4) 加密隧道 (TCP over SSL)"
+    read -p "请选择协议类型 [1-4, 默认1]: " proto_choice
     proto_choice=${proto_choice:-1}
-    
+
+    # 获取本地端口
+    read -p "请输入本地监听端口: " local_port
+    while ! echo "$local_port" | grep -qE '^[0-9]+$' || [ "$local_port" -lt 1 ] || [ "$local_port" -gt 65535 ]; do
+        read -p "无效端口，请重新输入: " local_port
+    done
+
+    # 获取远程地址和端口
+    read -p "请输入远程服务器IP或域名: " remote_addr
+    read -p "请输入远程服务器端口: " remote_port
+    while ! echo "$remote_port" | grep -qE '^[0-9]+$' || [ "$remote_port" -lt 1 ] || [ "$remote_port" -gt 65535 ]; do
+        read -p "无效端口，请重新输入: " remote_port
+    done
+
     # 生成规则ID
-    rule_id="$(date +%s)-$local_port"
+    rule_id=$(date +%s)
     
-    # 构建转发命令
+    # 构建不同协议的启动命令
     case $proto_choice in
-        1)
-            cmd="socat TCP-LISTEN:$local_port,reuseaddr,fork TCP:$target_ip:$target_port"
-            proto="tcp"
+        1)  # TCP
+            start_cmd="socat TCP-LISTEN:$local_port,reuseaddr,fork TCP:$remote_addr:$remote_port"
+            proto="TCP"
             ;;
-        2)
-            cmd="socat UDP-LISTEN:$local_port,reuseaddr,fork UDP:$target_ip:$target_port"
-            proto="udp"
+        2)  # UDP
+            start_cmd="socat UDP-LISTEN:$local_port,reuseaddr,fork UDP:$remote_addr:$remote_port"
+            proto="UDP"
             ;;
-        3)
-            cmd="socat TCP-LISTEN:$local_port,reuseaddr,fork TCP:$target_ip:$target_port & "
-            cmd="$cmd socat UDP-LISTEN:$local_port,reuseaddr,fork UDP:$target_ip:$target_port"
-            proto="tcp+udp"
+        3)  # TCP+UDP
+            start_cmd="socat TCP-LISTEN:$local_port,reuseaddr,fork TCP:$remote_addr:$remote_port & "
+            start_cmd="$start_cmd socat UDP-LISTEN:$local_port,reuseaddr,fork UDP:$remote_addr:$remote_port"
+            proto="TCP+UDP"
             ;;
-        4)
-            read -p "请输入SSL证书路径(默认: 自动生成临时证书): " cert_path
-            cert_path=${cert_path:-$CONFIG_DIR/temp_cert.pem}
+        4)  # 加密隧道
+            # 生成临时证书（如不存在）
+            [ -f "$CONFIG_DIR/cert.pem" ] || openssl req -x509 -newkey rsa:4096 -nodes \
+                -keyout "$CONFIG_DIR/key.pem" -out "$CONFIG_DIR/cert.pem" \
+                -days 365 -subj "/CN=socat-forward" >/dev/null 2>&1
             
-            # 生成临时证书
-            if [ ! -f $cert_path ]; then
-                apk add --no-cache openssl
-                openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 \
-                    -subj "/CN=socat-forward" \
-                    -keyout $cert_path -out $cert_path
-            fi
-            
-            cmd="socat OPENSSL-LISTEN:$local_port,cert=$cert_path,verify=0,fork TCP:$target_ip:$target_port"
-            proto="ssl-tcp"
+            start_cmd="socat TCP-LISTEN:$local_port,reuseaddr,fork OPENSSL:$remote_addr:$remote_port,verify=0"
+            proto="SSL-TCP"
             ;;
     esac
-    
-    # 保存规则
-    echo "$rule_id|$local_port|$target_ip:$target_port|$proto|$cmd" >> $RULES_FILE
-    echo "已添加规则 [ID: $rule_id]"
-    echo "本地端口: $local_port -> 目标: $target_ip:$target_port ($proto)"
-    
-    # 立即启动
-    eval "$cmd &"
-    echo $! > "$CONFIG_DIR/$rule_id.pid"
-}
 
-# 列出所有规则
-list_rules() {
-    echo "===== 当前转发规则 ====="
-    echo "ID                 本地端口  目标地址           协议"
-    echo "--------------------------------------------------------"
-    while IFS='|' read -r id lport target proto _; do
-        if [ -n "$id" ]; then
-            printf "%-18s %-8s %-20s %s\n" "$id" "$lport" "$target" "$proto"
-        fi
-    done < $RULES_FILE
+    # 写入规则配置
+    cat >> "$RULES_FILE" << EOF
+# $proto 转发: 本地 $local_port -> 远程 $remote_addr:$remote_port
+rule_$rule_id() {
+    if [ "\$1" = "start" ]; then
+        nohup $start_cmd >/dev/null 2>&1 &
+        echo \$! > $CONFIG_DIR/rule_$rule_id.pid
+    elif [ "\$1" = "stop" ]; then
+        [ -f "$CONFIG_DIR/rule_$rule_id.pid" ] && kill \$(cat $CONFIG_DIR/rule_$rule_id.pid) >/dev/null 2>&1
+        rm -f $CONFIG_DIR/rule_$rule_id.pid
+    fi
+}
+EOF
+
+    echo "规则添加成功！ID: $rule_id"
+    rule_$rule_id start  # 立即启动
+    read -p "按回车键返回主菜单..."
 }
 
 # 删除指定规则
 delete_rule() {
-    read -p "请输入要删除的规则ID: " rule_id
-    if grep -q "^$rule_id|" $RULES_FILE; then
-        # 停止进程
-        if [ -f "$CONFIG_DIR/$rule_id.pid" ]; then
-            kill $(cat "$CONFIG_DIR/$rule_id.pid") 2>/dev/null
-            rm -f "$CONFIG_DIR/$rule_id.pid"
-        fi
-        
-        # 删除规则
-        sed -i "/^$rule_id|/d" $RULES_FILE
-        echo "已删除规则 $rule_id"
-    else
-        echo "未找到规则 $rule_id"
+    show_rules
+    read -p "请输入要删除的规则序号: " rule_num
+    if [ -z "$rule_num" ]; then
+        echo "取消删除"
+        read -p "按回车键返回主菜单..."
+        return 1
     fi
+
+    # 获取对应规则ID
+    rule_id=$(grep -vE '^$|^#' "$RULES_FILE" | sed -n "${rule_num}p" | grep -oE 'rule_[0-9]+' | head -n1 | cut -d'_' -f2)
+    if [ -z "$rule_id" ]; then
+        echo "无效的规则序号"
+        read -p "按回车键返回主菜单..."
+        return 1
+    fi
+
+    # 停止并删除规则
+    rule_$rule_id stop
+    sed -i "/rule_$rule_id(),\{0,1\}/,/^}/d" "$RULES_FILE"  # 删除规则块
+    sed -i "/^#.*rule_$rule_id/d" "$RULES_FILE"  # 删除注释行
+    echo "规则 $rule_num (ID: $rule_id) 已删除"
+    read -p "按回车键返回主菜单..."
 }
 
-# 清除所有规则
+# 清空所有规则
 clear_all() {
-    read -p "确定要删除所有规则吗? (y/N): " confirm
+    read -p "确定要删除所有规则吗？[y/N] " confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        # 停止所有进程
-        for pidfile in $CONFIG_DIR/*.pid; do
-            if [ -f "$pidfile" ]; then
-                kill $(cat "$pidfile") 2>/dev/null
-                rm -f "$pidfile"
-            fi
-        done
+        # 停止所有规则
+        $RULES_FILE stop
         
         # 清空规则文件
-        > $RULES_FILE
-        echo "已清除所有规则"
+        > "$RULES_FILE"
+        echo "所有规则已清空"
+    else
+        echo "取消操作"
     fi
+    read -p "按回车键返回主菜单..."
 }
 
-# 启动所有规则
-start_rules() {
-    echo "启动所有转发规则..."
-    while IFS='|' read -r id _ _ _ cmd; do
-        if [ -n "$id" ]; then
-            eval "$cmd &"
-            echo $! > "$CONFIG_DIR/$id.pid"
-            echo "启动规则 $id"
-        fi
-    done < $RULES_FILE
-    echo "所有规则已启动"
+# 启动/停止所有规则
+control_rules() {
+    action=$1
+    if [ "$action" = "start" ]; then
+        echo "启动所有转发规则..."
+        # 逐个启动规则
+        grep -oE 'rule_[0-9]+' "$RULES_FILE" | sort -u | while read -r rule; do
+            $rule start
+        done
+    elif [ "$action" = "stop" ]; then
+        echo "停止所有转发规则..."
+        # 逐个停止规则
+        grep -oE 'rule_[0-9]+' "$RULES_FILE" | sort -u | while read -r rule; do
+            $rule stop
+        done
+    fi
+    read -p "按回车键返回主菜单..."
 }
 
-# 停止所有规则
-stop_rules() {
-    echo "停止所有转发规则..."
-    for pidfile in $CONFIG_DIR/*.pid; do
-        if [ -f "$pidfile" ]; then
-            kill $(cat "$pidfile") 2>/dev/null
-            rm -f "$pidfile"
-            echo "停止规则 $(basename $pidfile .pid)"
-        fi
-    done
-}
-
-# 显示帮助
-show_help() {
-    echo "Socat 端口转发管理脚本"
-    echo "用法: $0 [选项]"
-    echo "选项:"
-    echo "  add      - 添加新转发规则"
-    echo "  list     - 列出所有转发规则"
-    echo "  delete   - 删除指定规则"
-    echo "  clear    - 清除所有规则"
-    echo "  start    - 启动所有规则"
-    echo "  stop     - 停止所有规则"
-    echo "  restart  - 重启所有规则"
-    echo "  help     - 显示帮助信息"
+# 显示主菜单
+show_menu() {
+    clear
+    echo "=============================="
+    echo "      Socat 转发管理工具       "
+    echo "=============================="
+    echo "1. 添加新转发规则"
+    echo "2. 查看所有转发规则"
+    echo "3. 删除指定转发规则"
+    echo "4. 清空所有转发规则"
+    echo "5. 启动所有转发规则"
+    echo "6. 停止所有转发规则"
+    echo "7. 重启所有转发规则"
+    echo "8. 退出"
+    echo "=============================="
+    read -p "请输入操作编号 [1-8]: " choice
 }
 
 # 主逻辑
-init_env
+main() {
+    init_env  # 初始化环境
+    chmod +x "$RULES_FILE"  # 确保规则文件可执行
+    
+    while true; do
+        show_menu
+        case "$choice" in
+            1)
+                add_rule
+                ;;
+            2)
+                show_rules
+                read -p "按回车键返回主菜单..."
+                ;;
+            3)
+                delete_rule
+                ;;
+            4)
+                clear_all
+                ;;
+            5)
+                control_rules start
+                ;;
+            6)
+                control_rules stop
+                ;;
+            7)
+                control_rules stop
+                control_rules start
+                echo "所有规则已重启"
+                read -p "按回车键返回主菜单..."
+                ;;
+            8)
+                echo "感谢使用，再见！"
+                exit 0
+                ;;
+            *)
+                echo "无效的选择，请输入 1-8 之间的数字"
+                read -p "按回车键继续..."
+                ;;
+        esac
+    done
+}
 
-case "$1" in
-    add)
-        add_rule
-        ;;
-    list)
-        list_rules
-        ;;
-    delete)
-        delete_rule
-        ;;
-    clear)
-        clear_all
-        ;;
-    start)
-        start_rules
-        ;;
-    stop)
-        stop_rules
-        ;;
-    restart)
-        stop_rules
-        start_rules
-        ;;
-    help|*)
-        show_help
-        ;;
-esac
+# 执行主函数
+main "$@"
