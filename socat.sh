@@ -71,21 +71,31 @@ EOF
     fi
 }
 
-# 安装socat
-install_socat() {
-    echo "正在检查并安装socat..."
-    if ! command -v socat >/dev/null 2>&1; then
-        apk update >/dev/null
-        apk add --no-cache socat >/dev/null
-        if [ $? -eq 0 ]; then
-            echo "socat安装成功"
-        else
-            echo "socat安装失败，请检查网络连接"
-            exit 1
+# 安装必要工具
+install_dependencies() {
+    echo "正在检查并安装必要工具..."
+    local dependencies=("socat" "net-tools")  # 添加net-tools以获取netstat
+    
+    for dep in "${dependencies[@]}"; do
+        if ! command -v $dep >/dev/null 2>&1; then
+            # 特殊处理：netstat在net-tools包中
+            if [ "$dep" = "net-tools" ]; then
+                if ! command -v netstat >/dev/null 2>&1; then
+                    echo "安装 net-tools (包含netstat)..."
+                    apk add --no-cache net-tools >/dev/null
+                fi
+            else
+                echo "安装 $dep..."
+                apk add --no-cache $dep >/dev/null
+            fi
+            
+            if [ $? -ne 0 ]; then
+                echo "$dep 安装失败，请检查网络连接"
+                exit 1
+            fi
         fi
-    else
-        echo "socat已安装"
-    fi
+    done
+    echo "必要工具已准备就绪"
 }
 
 # 获取下一个规则ID
@@ -179,8 +189,8 @@ add_rule() {
     while true; do
         read -p "请输入本地监听端口 [1-65535]: " local_port
         if [[ $local_port =~ ^[0-9]+$ ]] && [ $local_port -ge 1 ] && [ $local_port -le 65535 ]; then
-            # 检查端口是否已被占用
-            if ss -tuln | grep -q ":$local_port"; then
+            # 检查端口是否已被占用，使用netstat替代ss
+            if netstat -tuln | grep -q ":$local_port"; then
                 echo "端口 $local_port 已被占用，请选择其他端口"
             else
                 break
@@ -316,8 +326,8 @@ start_single_rule() {
     # 启动TCP转发
     if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
         if ! pgrep -F $PID_DIR/socat-tcp-$rule_id.pid >/dev/null 2>&1; then
-            # 检查端口是否已被占用
-            if ss -tuln | grep -q ":$local_port"; then
+            # 检查端口是否已被占用，使用netstat替代ss
+            if netstat -tuln | grep -q ":$local_port"; then
                 echo "警告: 端口 $local_port 已被占用，TCP转发启动失败"
             else
                 socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_host:$remote_port &
@@ -332,8 +342,8 @@ start_single_rule() {
     # 启动UDP转发
     if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
         if ! pgrep -F $PID_DIR/socat-udp-$rule_id.pid >/dev/null 2>&1; then
-            # 检查端口是否已被占用
-            if ss -tuln | grep -q ":$local_port"; then
+            # 检查端口是否已被占用，使用netstat替代ss
+            if netstat -tuln | grep -q ":$local_port"; then
                 echo "警告: 端口 $local_port 已被占用，UDP转发启动失败"
             else
                 socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_host:$remote_port &
@@ -467,8 +477,8 @@ main() {
     # 初始化环境
     init_env
     
-    # 安装socat
-    install_socat
+    # 安装必要依赖
+    install_dependencies
     
     # 主循环
     while true; do
