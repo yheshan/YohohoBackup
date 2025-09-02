@@ -2,8 +2,8 @@
 # Socat端口转发一键管理脚本
 # 支持TCP/UDP协议，自动后台运行，系统重启自动恢复
 
-# 配置文件路径
-CONFIG_file="/etc/socat-forward.conf"
+# 配置文件路径（修复变量名拼写错误）
+CONFIG_FILE="/etc/socat-forward.conf"
 service_file=""
 rc_local="/etc/rc.local"
 
@@ -19,11 +19,13 @@ detect_system() {
         fi
         # 确保rc.local服务启用
         if ! rc-update show | grep -q "rc.local"; then
+            # 修复Alpine系统下rc.local启用命令
             rc-update add local default >/dev/null 2>&1
-        fi
-        # 确保rc.local可执行
-        if [ -f "$rc_local" ] && [ ! -x "$rc_local" ]; then
-            chmod +x "$rc_local"
+            # 确保rc.local文件存在并可执行
+            if [ ! -f "$rc_local" ]; then
+                echo "#!/bin/sh" > "$rc_local"
+                chmod +x "$rc_local"
+            fi
         fi
     elif [ -f "/etc/systemd/system.conf" ]; then
         echo "检测到Systemd系统"
@@ -53,10 +55,10 @@ check_socat() {
 
 # 创建配置文件
 create_config() {
-    if [ ! -f "$config_file" ]; then
-        echo "# 格式: 协议 本地端口 远程IP 远程端口 备注" > "$config_file"
-        echo "# 示例: tcp 8080 192.168.1.100 80 网站转发" >> "$config_file"
-        echo "# 协议支持: tcp, udp, tcp+udp" >> "$config_file"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "# 格式: 协议 本地端口 远程IP 远程端口 备注" > "$CONFIG_FILE"
+        echo "# 示例: tcp 8080 192.168.1.100 80 网站转发" >> "$CONFIG_FILE"
+        echo "# 协议支持: tcp, udp, tcp+udp" >> "$CONFIG_FILE"
     fi
 }
 
@@ -81,7 +83,7 @@ EOF
         systemctl daemon-reload >/dev/null 2>&1
         systemctl enable socat-forward >/dev/null 2>&1
     elif [ -f "/etc/alpine-release" ]; then
-        # OpenRC服务
+        # OpenRC服务（优化Alpine支持）
         cat > "$service_file" << EOF
 #!/sbin/openrc-run
 description="Socat Port Forwarding Service"
@@ -155,13 +157,13 @@ add_rule() {
     read -p "请输入备注 (可选): " comment
     
     # 检查规则是否已存在
-    if grep -qE "^${proto} +${local_port} +${remote_ip} +${remote_port}" "$config_file"; then
+    if grep -qE "^${proto} +${local_port} +${remote_ip} +${remote_port}" "$CONFIG_FILE"; then
         echo "该转发规则已存在!"
         return 1
     fi
     
     # 添加到配置文件
-    echo "${proto} ${local_port} ${remote_ip} ${remote_port} ${comment}" >> "$config_file"
+    echo "${proto} ${local_port} ${remote_ip} ${remote_port} ${comment}" >> "$CONFIG_FILE"
     echo "规则添加成功!"
     
     # 立即启动该规则
@@ -193,7 +195,7 @@ show_rules() {
         
         echo "${count} | ${proto} | ${local_port} | ${remote_ip} | ${remote_port} | ${status} | ${comment}"
         ((count++))
-    done < "$config_file"
+    done < "$CONFIG_FILE"
 }
 
 # 启动单个规则
@@ -255,7 +257,7 @@ start_all() {
         remote_port=$(echo "$line" | awk '{print $4}')
         
         start_single_rule "$proto" "$local_port" "$remote_ip" "$remote_port"
-    done < "$config_file"
+    done < "$CONFIG_FILE"
 }
 
 # 停止所有规则
@@ -276,7 +278,7 @@ delete_rule() {
     read -p "请输入要删除的规则序号: " num
     
     # 获取要删除的行
-    line=$(sed -n "${num}p" "$config_file" | grep -v '^#')
+    line=$(sed -n "${num}p" "$CONFIG_FILE" | grep -v '^#')
     if [ -z "$line" ]; then
         echo "无效的序号!"
         return 1
@@ -291,7 +293,7 @@ delete_rule() {
     stop_single_rule "$proto" "$local_port" "$remote_ip" "$remote_port"
     
     # 从配置文件中删除
-    sed -i "${num}d" "$config_file"
+    sed -i "${num}d" "$CONFIG_FILE"
     echo "规则已删除"
 }
 
@@ -301,8 +303,8 @@ clear_all() {
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         stop_all
         # 保留注释行
-        grep '^#' "$config_file" > "$config_file.tmp"
-        mv "$config_file.tmp" "$config_file"
+        grep '^#' "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
+        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
         echo "所有规则已清空"
     else
         echo "操作已取消"
