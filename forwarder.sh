@@ -1,5 +1,5 @@
 #!/bin/bash
-# 多功能端口转发脚本 v4 - 进一步优化协议选择显示
+# 多功能端口转发脚本 v5 - 彻底修复协议选择显示问题
 # 兼容 Alpine、Debian/Ubuntu、CentOS
 
 # 检查root权限
@@ -96,48 +96,54 @@ show_menu() {
     read -p "请选择功能 [0-6]: " choice
 }
 
-# 选择协议类型 - 确保显示所有选项
+# 选择协议类型 - 重写版本，确保显示选项
 select_protocol() {
-    local proto=""
-    while [ -z "$proto" ] || [ "$proto" = "invalid" ]; do
-        echo -e "\n请选择协议类型:"
-        echo "1 - TCP"
-        echo "2 - UDP"
-        echo "3 - 同时支持TCP和UDP"
-        read -p "请输入数字选择 [1-3]: " proto_choice
-        
-        case $proto_choice in
-            1)
-                proto="tcp"
-                ;;
-            2)
-                proto="udp"
-                ;;
-            3)
-                proto="all"
-                ;;
-            *)
-                echo "无效的选择，请输入1、2或3"
-                proto="invalid"
-                ;;
-        esac
-    done
-    echo "$proto"
+    # 直接打印选项，不使用循环嵌套
+    echo -e "\n协议类型选择："
+    echo "1) TCP"
+    echo "2) UDP"
+    echo "3) 同时支持TCP和UDP"
+    
+    # 读取用户输入
+    read -p "请选择 [1-3]: " proto_choice
+    
+    # 判断输入并返回对应值
+    case $proto_choice in
+        1) return 0 ;;  # TCP
+        2) return 1 ;;  # UDP
+        3) return 2 ;;  # ALL
+        *) 
+            echo "错误：请输入1、2或3"
+            return 3     # 无效
+            ;;
+    esac
 }
 
 # 添加iptables转发规则
 add_iptables_rule() {
     echo "===== 添加iptables转发规则 ====="
-    proto=$(select_protocol)
+    
+    # 调用协议选择函数并处理结果
+    select_protocol
+    proto_result=$?
+    
+    # 根据返回值确定协议
+    case $proto_result in
+        0) proto="tcp" ;;
+        1) proto="udp" ;;
+        2) proto="all" ;;
+        3) return ;;  # 无效输入，返回
+    esac
     
     read -p "请输入本地端口: " local_port
     read -p "请输入目标IP: " target_ip
     read -p "请输入目标端口: " target_port
 
-    # 保存规则到临时文件以便后续删除
+    # 保存规则注释
     rule_comment="iptables|$proto|$local_port|$target_ip|$target_port"
     echo "$rule_comment" >> "$IPTABLES_RULES_FILE.comment"
 
+    # 添加对应规则
     case $proto in
         tcp)
             iptables -t nat -A PREROUTING -p tcp --dport $local_port -j DNAT --to-destination $target_ip:$target_port -m comment --comment "$rule_comment"
@@ -165,7 +171,6 @@ add_iptables_rule() {
             ;;
         debian)
             iptables-save > "$IPTABLES_RULES_FILE"
-            # 设置开机自动加载
             if ! grep -q "iptables-restore < $IPTABLES_RULES_FILE" /etc/rc.local; then
                 echo "iptables-restore < $IPTABLES_RULES_FILE" >> /etc/rc.local
                 chmod +x /etc/rc.local
@@ -180,7 +185,18 @@ add_iptables_rule() {
 # 添加nftables转发规则
 add_nftables_rule() {
     echo "===== 添加nftables转发规则 ====="
-    proto=$(select_protocol)
+    
+    # 调用协议选择函数
+    select_protocol
+    proto_result=$?
+    
+    # 处理选择结果
+    case $proto_result in
+        0) proto="tcp" ;;
+        1) proto="udp" ;;
+        2) proto="all" ;;
+        3) return ;;  # 无效输入
+    esac
     
     read -p "请输入本地端口: " local_port
     read -p "请输入目标IP: " target_ip
@@ -191,10 +207,11 @@ add_nftables_rule() {
     nft add chain ip nat prerouting '{ type nat hook prerouting priority 0; policy accept; }' 2>/dev/null
     nft add chain ip nat postrouting '{ type nat hook postrouting priority 100; policy accept; }' 2>/dev/null
 
-    # 保存规则信息以便后续删除
+    # 保存规则信息
     rule_handle="nftables|$proto|$local_port|$target_ip|$target_port"
     echo "$rule_handle" >> "$NFTABLES_RULES_FILE.comment"
 
+    # 添加规则
     case $proto in
         tcp)
             nft add rule ip nat prerouting tcp dport $local_port dnat to $target_ip:$target_port comment "\"$rule_handle\""
@@ -228,27 +245,33 @@ add_nftables_rule() {
     esac
 }
 
-# 添加socat转发规则（默认后台运行并设置开机启动）
+# 添加socat转发规则
 add_socat_rule() {
     echo "===== 添加socat转发规则 ====="
-    proto=$(select_protocol)
     
+    # 调用协议选择函数
+    select_protocol
+    proto_result=$?
+    
+    # 处理选择结果
+    case $proto_result in
+        0) proto="tcp" ;;
+        1) proto="udp" ;;
+        2) 
+            echo "socat将分别创建TCP和UDP转发服务"
+            proto="all" 
+            ;;
+        3) return ;;  # 无效输入
+    esac
+    
+    read -p "请输入本地端口: " local_port
+    read -p "请输入目标IP: " target_ip
+    read -p "请输入目标端口: " target_port
+
     if [ "$proto" = "all" ]; then
-        echo "socat 不支持同时选择TCP和UDP，将为您分别创建两个服务"
-        # 创建TCP规则
-        read -p "请输入本地端口: " local_port
-        read -p "请输入目标IP: " target_ip
-        read -p "请输入目标端口: " target_port
-        
-        # 先创建TCP服务
         create_socat_service "tcp" $local_port $target_ip $target_port
-        
-        # 再创建UDP服务
         create_socat_service "udp" $local_port $target_ip $target_port
     else
-        read -p "请输入本地端口: " local_port
-        read -p "请输入目标IP: " target_ip
-        read -p "请输入目标端口: " target_port
         create_socat_service $proto $local_port $target_ip $target_port
     fi
 }
@@ -276,20 +299,12 @@ create_socat_service() {
         alpine)
             ln -sf "$service_path" /etc/init.d/
             rc-update add "$service_name" default
+            rc-service "$service_name" start
             ;;
         debian|centos)
             ln -sf "$service_path" /etc/systemd/system/
             systemctl daemon-reload
             systemctl enable "$service_name"
-            ;;
-    esac
-    
-    # 启动服务
-    case $OS in
-        alpine)
-            rc-service "$service_name" start
-            ;;
-        debian|centos)
             systemctl start "$service_name"
             ;;
     esac
@@ -321,10 +336,10 @@ show_rules() {
 # 删除指定规则
 delete_rule() {
     echo "请选择要删除的规则类型:"
-    echo "1. iptables 规则"
-    echo "2. nftables 规则"
-    echo "3. socat 服务"
-    read -p "请输入数字选择 [1-3]: " type_choice
+    echo "1) iptables 规则"
+    echo "2) nftables 规则"
+    echo "3) socat 服务"
+    read -p "请选择 [1-3]: " type_choice
 
     case $type_choice in
         1) # 删除iptables规则
@@ -333,17 +348,10 @@ delete_rule() {
             read -p "请输入要删除的规则编号: " rule_num
             if [ -n "$rule_num" ] && [ "$rule_num" -eq "$rule_num" ] 2>/dev/null; then
                 iptables -t nat -D PREROUTING $rule_num
-                # 保存更改
                 case $OS in
-                    alpine)
-                        iptables-save > "$IPTABLES_RULES_FILE"
-                        ;;
-                    debian)
-                        iptables-save > "$IPTABLES_RULES_FILE"
-                        ;;
-                    centos)
-                        service iptables save
-                        ;;
+                    alpine) iptables-save > "$IPTABLES_RULES_FILE" ;;
+                    debian) iptables-save > "$IPTABLES_RULES_FILE" ;;
+                    centos) service iptables save ;;
                 esac
                 echo "已删除iptables规则 #$rule_num"
             else
@@ -367,16 +375,11 @@ delete_rule() {
         3) # 删除socat服务
             echo "当前socat服务:"
             case $OS in
-                alpine)
-                    rc-service --list | grep socat
-                    ;;
-                debian|centos)
-                    systemctl list-units --type=service --full --all | grep socat
-                    ;;
+                alpine) rc-service --list | grep socat ;;
+                debian|centos) systemctl list-units --type=service --full --all | grep socat ;;
             esac
             read -p "请输入要删除的服务名称 (例如: socat-tcp-8080.service): " service_name
             if [ -n "$service_name" ]; then
-                # 停止并禁用服务
                 case $OS in
                     alpine)
                         rc-service "$service_name" stop
@@ -387,13 +390,8 @@ delete_rule() {
                         systemctl disable "$service_name"
                         ;;
                 esac
-                # 删除服务文件
                 rm -f "$SOCAT_SERVICE_DIR/$service_name"
-                case $OS in
-                    debian|centos)
-                        systemctl daemon-reload
-                        ;;
-                esac
+                [ "$OS" != "alpine" ] && systemctl daemon-reload
                 echo "已删除socat服务: $service_name"
             else
                 echo "无效的服务名称"
@@ -418,15 +416,9 @@ clear_rules() {
     iptables -t nat -F
     iptables -t nat -X
     case $OS in
-        alpine)
-            iptables-save > "$IPTABLES_RULES_FILE"
-            ;;
-        debian)
-            iptables-save > "$IPTABLES_RULES_FILE"
-            ;;
-        centos)
-            service iptables save
-            ;;
+        alpine) iptables-save > "$IPTABLES_RULES_FILE" ;;
+        debian) iptables-save > "$IPTABLES_RULES_FILE" ;;
+        centos) service iptables save ;;
     esac
 
     # 清除nftables规则
@@ -465,34 +457,18 @@ main() {
     while true; do
         show_menu
         case $choice in
-            1)
-                add_iptables_rule
-                read -p "按任意键继续..."
-                ;;
-            2)
-                add_nftables_rule
-                read -p "按任意键继续..."
-                ;;
-            3)
-                add_socat_rule
-                read -p "按任意键继续..."
-                ;;
-            4)
-                show_rules
-                ;;
-            5)
-                delete_rule
-                ;;
-            6)
-                clear_rules
-                ;;
-            0)
+            1) add_iptables_rule; read -p "按任意键继续..." ;;
+            2) add_nftables_rule; read -p "按任意键继续..." ;;
+            3) add_socat_rule; read -p "按任意键继续..." ;;
+            4) show_rules ;;
+            5) delete_rule ;;
+            6) clear_rules ;;
+            0) 
                 echo "退出脚本"
-                # 清理临时文件
                 rm -f "$SOCAT_SERVICE_TEMPLATE"
-                exit 0
+                exit 0 
                 ;;
-            *)
+            *) 
                 echo "无效选择，请输入0-6之间的数字"
                 read -p "按任意键继续..."
                 ;;
