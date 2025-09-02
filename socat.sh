@@ -1,5 +1,5 @@
 #!/bin/sh
-# Socat端口转发一键管理脚本 (Alpine Linux专用) - 彻底修复版
+# Socat端口转发一键管理脚本 (Alpine Linux专用) - ash兼容版
 # 支持TCP/UDP协议，规则持久化，多端口转发
 
 # 配置变量
@@ -71,33 +71,28 @@ EOF
     fi
 }
 
-# 安装必要工具
+# 安装必要工具（使用ash兼容语法）
 install_dependencies() {
     echo "正在检查并安装必要工具..."
-    local dependencies=("socat" "net-tools")  # 添加net-tools以获取netstat
     
-    # 检查并安装依赖
-    for dep in "${dependencies[@]}"; do
-        if [ "$dep" = "net-tools" ]; then
-            # 特殊处理netstat
-            if ! command -v netstat >/dev/null 2>&1; then
-                echo "安装 net-tools (包含netstat)..."
-                if ! apk add --no-cache net-tools >/dev/null; then
-                    echo "错误：无法安装net-tools，请检查网络"
-                    exit 1
-                fi
-            fi
-        else
-            # 处理其他依赖
-            if ! command -v $dep >/dev/null 2>&1; then
-                echo "安装 $dep..."
-                if ! apk add --no-cache $dep >/dev/null; then
-                    echo "错误：无法安装$dep，请检查网络"
-                    exit 1
-                fi
-            fi
+    # 检查并安装socat
+    if ! command -v socat >/dev/null 2>&1; then
+        echo "安装 socat..."
+        if ! apk add --no-cache socat >/dev/null; then
+            echo "错误：无法安装socat，请检查网络"
+            exit 1
         fi
-    done
+    fi
+    
+    # 检查并安装net-tools（包含netstat）
+    if ! command -v netstat >/dev/null 2>&1; then
+        echo "安装 net-tools (包含netstat)..."
+        if ! apk add --no-cache net-tools >/dev/null; then
+            echo "错误：无法安装net-tools，请检查网络"
+            exit 1
+        fi
+    fi
+    
     echo "必要工具已准备就绪"
 }
 
