@@ -1,15 +1,13 @@
 #!/bin/bash
-# 安全增强版端口转发脚本
+# 简化版端口转发脚本
 # 仅支持 iptables 和 socat
 # 支持 TCP、UDP、TCP+UDP
-# 包含SSH保护机制，防止连接丢失
+# 配置自动持久化，重启后生效
 
 # 配置文件路径
 CONFIG_DIR="/etc/forwarding"
 CONFIG_FILE="$CONFIG_DIR/rules.conf"
 SERVICE_FILE="/etc/init.d/forwarding"
-# 保护SSH端口（默认22，可根据实际情况修改）
-SSH_PORT=22
 
 # 确保配置目录存在
 mkdir -p $CONFIG_DIR
@@ -28,8 +26,6 @@ init_service() {
         cat << EOF > $SERVICE_FILE
 #!/sbin/openrc-run
 description="Port forwarding service"
-# 确保网络就绪后再启动
-after=network-online.target
 start() {
     ebegin "Starting port forwarding"
     $0 start_all
@@ -46,34 +42,11 @@ EOF
     fi
 }
 
-# 安全检查：防止屏蔽SSH端口
-security_check() {
-    local_port=$1
-    
-    # 禁止转发SSH端口
-    if [ "$local_port" -eq "$SSH_PORT" ]; then
-        echo "错误：不能使用SSH端口($SSH_PORT)作为本地转发端口，这会导致连接中断！"
-        return 1
-    fi
-    
-    return 0
-}
-
-# 确保SSH端口始终开放（iptables）
-ensure_ssh_access() {
-    # 检查是否已有允许SSH的规则
-    if ! iptables -C INPUT -p tcp --dport $SSH_PORT -j ACCEPT 2>/dev/null; then
-        # 添加允许SSH访问的规则
-        iptables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT
-        echo "已添加SSH端口($SSH_PORT)保护规则"
-    fi
-}
-
 # 显示菜单
 show_menu() {
     clear
     echo "============================================="
-    echo "           端口转发管理脚本 (安全版)         "
+    echo "           端口转发管理脚本 (精简版)         "
     echo "============================================="
     echo "1. 添加新转发规则"
     echo "2. 查看所有转发规则"
@@ -82,10 +55,9 @@ show_menu() {
     echo "5. 停止所有转发规则"
     echo "6. 重启所有转发规则"
     echo "7. 一键清除所有规则"
-    echo "8. 修复SSH连接（紧急）"
     echo "0. 退出"
     echo "============================================="
-    read -p "请选择操作 [0-8]: " choice
+    read -p "请选择操作 [0-7]: " choice
 }
 
 # 添加规则
@@ -122,12 +94,6 @@ add_rule() {
     
     # 输入端口和目标
     read -p "请输入本地监听端口: " local_port
-    # 安全检查
-    if ! security_check $local_port; then
-        sleep 3
-        return
-    fi
-    
     read -p "请输入目标IP地址: " dest_ip
     read -p "请输入目标端口: " dest_port
     read -p "请输入备注(可选): " comment
@@ -138,8 +104,9 @@ add_rule() {
     rule_number=$(grep -c '^[^#]' $CONFIG_FILE)
     echo -e "\n规则已添加，编号为: $rule_number"
     
-    # 默认自动启动规则
+    # 默认自动启动规则，只需按回车或输入n取消
     read -p "是否立即启动该规则? (y/n，默认y): " start_now
+    # 如果用户直接回车或输入y/Y，都启动规则
     if [ -z "$start_now" ] || [ "$start_now" = "y" ] || [ "$start_now" = "Y" ]; then
         start_rule $rule_number
     else
@@ -246,11 +213,6 @@ start_rule() {
         return 1
     fi
     
-    # 安全检查
-    if ! security_check $local_port; then
-        return 1
-    fi
-    
     # 检查是否已运行
     if is_running $rule_num; then
         echo "规则 $rule_num 已在运行"
@@ -259,17 +221,10 @@ start_rule() {
     
     echo "启动规则 $rule_num: $tool $proto $local_port -> $dest_ip:$dest_port"
     
-    # 确保SSH端口始终开放
-    if [ "$tool" = "iptables" ]; then
-        ensure_ssh_access
-    fi
-    
     case $tool in
         iptables)
             # 启用IP转发
-            if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-                echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-            fi
+            echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
             sysctl -p >/dev/null
             
             # 添加TCP规则
@@ -284,8 +239,7 @@ start_rule() {
                 iptables -t nat -A POSTROUTING -p udp -d $dest_ip --dport $dest_port -j MASQUERADE
             fi
             
-            # 保存规则前再次确保SSH规则存在
-            ensure_ssh_access
+            # 保存规则
             iptables-save > /etc/iptables/rules.v4
             ;;
             
@@ -344,8 +298,7 @@ stop_rule() {
                 iptables -t nat -D POSTROUTING -p udp -d $dest_ip --dport $dest_port -j MASQUERADE
             fi
             
-            # 保存规则时确保SSH规则保留
-            ensure_ssh_access
+            # 保存规则
             iptables-save > /etc/iptables/rules.v4
             ;;
             
@@ -370,8 +323,6 @@ stop_rule() {
 # 启动所有规则
 start_all() {
     echo "启动所有转发规则..."
-    # 先确保SSH端口开放
-    ensure_ssh_access
     total_rules=$(grep -c '^[^#]' $CONFIG_FILE)
     
     for ((i=1; i<=$total_rules; i++)); do
@@ -443,33 +394,7 @@ clear_all() {
     grep '^#' $CONFIG_FILE > $CONFIG_FILE.tmp
     mv $CONFIG_FILE.tmp $CONFIG_FILE
     
-    # 保留SSH访问规则
-    ensure_ssh_access
-    iptables-save > /etc/iptables/rules.v4
-    
-    echo "所有规则已清除，保留了SSH访问规则"
-    read -p "按任意键返回菜单..."
-}
-
-# 修复SSH连接（紧急功能）
-fix_ssh() {
-    echo "正在修复SSH连接..."
-    
-    # 清除可能阻止SSH的规则
-    iptables -F INPUT
-    iptables -F FORWARD
-    iptables -F OUTPUT
-    iptables -t nat -F
-    
-    # 确保SSH端口允许访问
-    iptables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT
-    # 允许已建立的连接
-    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-    
-    # 保存规则
-    iptables-save > /etc/iptables/rules.v4
-    
-    echo "SSH连接修复完成，请尝试重新连接"
+    echo "所有规则已清除"
     read -p "按任意键返回菜单..."
 }
 
@@ -486,7 +411,6 @@ while true; do
         5) stop_all; read -p "按任意键返回菜单..." ;;
         6) stop_all; start_all; read -p "按任意键返回菜单..." ;;
         7) clear_all ;;
-        8) fix_ssh ;;
         0) echo "退出脚本"; exit 0 ;;
         *) echo "无效选择，请重试"; sleep 2 ;;
     esac
