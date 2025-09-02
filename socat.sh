@@ -1,169 +1,405 @@
-#!/bin/ash
+#!/bin/sh
+# Socat端口转发一键管理脚本 (Alpine Linux专用)
+# 支持TCP/UDP协议，规则持久化，多端口转发
 
-# 配置文件目录
-CONF_DIR="/etc/socat-forward"
-RULES_FILE="$CONF_DIR/rules.conf"
+# 配置变量
+RULES_FILE="/etc/socat-rules.conf"
+SERVICE_FILE="/etc/init.d/socat-forward"
 PID_DIR="/var/run/socat"
-LOG_FILE="/var/log/socat.log"
 
-# 初始化环境
-init() {
-    # 安装依赖
-    apk add --no-cache socat >/dev/null 2>&1
+# 确保必要目录和文件存在
+init_env() {
+    # 创建PID目录
+    mkdir -p $PID_DIR
+    chmod 755 $PID_DIR
     
-    # 创建目录
-    mkdir -p "$CONF_DIR" "$PID_DIR"
-    touch "$RULES_FILE" "$LOG_FILE"
+    # 创建规则文件
+    if [ ! -f $RULES_FILE ]; then
+        touch $RULES_FILE
+        chmod 644 $RULES_FILE
+    fi
     
-    # 启用IP转发
-    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    sysctl -p >/dev/null
+    # 创建服务文件
+    create_service_file
+}
+
+# 创建系统服务文件
+create_service_file() {
+    if [ ! -f $SERVICE_FILE ]; then
+        cat > $SERVICE_FILE << 'EOF'
+#!/sbin/openrc-run
+# 提供socat转发服务的openrc服务脚本
+
+RULES_FILE="/etc/socat-rules.conf"
+PID_DIR="/var/run/socat"
+
+depend() {
+    need net
+    after firewall
+}
+
+start() {
+    ebegin "Starting socat forward services"
+    
+    # 确保PID目录存在
+    mkdir -p $PID_DIR
+    chmod 755 $PID_DIR
+    
+    # 启动所有规则
+    while IFS= read -r rule; do
+        # 跳过空行和注释
+        [ -z "$rule" ] || [ "${rule#\#}" != "$rule" ] && continue
+        
+        # 解析规则
+        id=$(echo "$rule" | awk '{print $1}')
+        proto=$(echo "$rule" | awk '{print $2}')
+        local_port=$(echo "$rule" | awk '{print $3}')
+        remote_host=$(echo "$rule" | awk '{print $4}')
+        remote_port=$(echo "$rule" | awk '{print $5}')
+        
+        # 启动转发进程
+        if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
+            socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_host:$remote_port &
+            echo $! > $PID_DIR/socat-tcp-$id.pid
+        fi
+        
+        if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
+            socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_host:$remote_port &
+            echo $! > $PID_DIR/socat-udp-$id.pid
+        fi
+    done < $RULES_FILE
+    
+    eend $?
+}
+
+stop() {
+    ebegin "Stopping socat forward services"
+    
+    # 停止所有转发进程
+    for pidfile in $PID_DIR/*.pid; do
+        if [ -f "$pidfile" ]; then
+            kill $(cat "$pidfile") >/dev/null 2>&1
+            rm -f "$pidfile"
+        fi
+    done
+    
+    eend $?
+}
+
+restart() {
+    stop
+    start
+}
+EOF
+        chmod 755 $SERVICE_FILE
+    fi
+}
+
+# 安装socat
+install_socat() {
+    echo "正在检查并安装socat..."
+    if ! command -v socat >/dev/null 2>&1; then
+        apk update >/dev/null
+        apk add --no-cache socat >/dev/null
+        if [ $? -eq 0 ]; then
+            echo "socat安装成功"
+        else
+            echo "socat安装失败，请检查网络连接"
+            exit 1
+        fi
+    else
+        echo "socat已安装"
+    fi
+}
+
+# 获取下一个规则ID
+get_next_id() {
+    if [ ! -s $RULES_FILE ]; then
+        echo 1
+        return
+    fi
+    last_id=$(awk '{print $1}' $RULES_FILE | sort -n | tail -1)
+    echo $((last_id + 1))
 }
 
 # 添加转发规则
 add_rule() {
-    echo ">>> 添加转发规则 (输入q退出)"
-    while true; do
-        read -p "本地监听端口: " LOCAL_PORT
-        [ "$LOCAL_PORT" = "q" ] && break
-        
-        read -p "远程服务器IP: " REMOTE_IP
-        read -p "远程端口: " REMOTE_PORT
-        read -p "协议类型 [tcp/udp/both]: " PROTO
-        
-        # 验证输入
-        case "$PROTO" in
-            tcp|udp|both) ;;
-            *) echo "错误协议! 使用 tcp/udp/both"; continue ;;
-        esac
-        
-        # 保存规则
-        echo "$LOCAL_PORT:$REMOTE_IP:$REMOTE_PORT:$PROTO" >> "$RULES_FILE"
-        echo "规则已添加: $LOCAL_PORT → $REMOTE_IP:$REMOTE_PORT ($PROTO)"
-    done
-}
-
-# 启动转发
-start_all() {
-    stop_all >/dev/null
-    while IFS=: read -r LOCAL_PORT REMOTE_IP REMOTE_PORT PROTO; do
-        case "$PROTO" in
-            tcp)
-                socat TCP-LISTEN:$LOCAL_PORT,fork,reuseaddr TCP:$REMOTE_IP:$REMOTE_PORT >> "$LOG_FILE" 2>&1 &
-                echo $! > "$PID_DIR/tcp_$LOCAL_PORT.pid"
-                ;;
-            udp)
-                socat UDP-LISTEN:$LOCAL_PORT,fork,reuseaddr UDP:$REMOTE_IP:$REMOTE_PORT >> "$LOG_FILE" 2>&1 &
-                echo $! > "$PID_DIR/udp_$LOCAL_PORT.pid"
-                ;;
-            both)
-                socat TCP-LISTEN:$LOCAL_PORT,fork,reuseaddr TCP:$REMOTE_IP:$REMOTE_PORT >> "$LOG_FILE" 2>&1 &
-                echo $! > "$PID_DIR/tcp_$LOCAL_PORT.pid"
-                socat UDP-LISTEN:$LOCAL_PORT,fork,reuseaddr UDP:$REMOTE_IP:$REMOTE_PORT >> "$LOG_FILE" 2>&1 &
-                echo $! > "$PID_DIR/udp_$LOCAL_PORT.pid"
-                ;;
-        esac
-    done < "$RULES_FILE"
-    echo "所有规则已启动"
-}
-
-# 停止转发
-stop_all() {
-    for pidfile in "$PID_DIR"/*.pid; do
-        [ -f "$pidfile" ] && kill $(cat "$pidfile") 2>/dev/null
-    done
-    rm -f "$PID_DIR"/*.pid
-    echo "所有规则已停止"
-}
-
-# 删除规则
-delete_rules() {
-    echo "1) 删除单条规则"
-    echo "2) 删除所有规则"
-    read -p "选择操作: " choice
+    echo "===== 添加新转发规则 ====="
     
-    case $choice in
-        1)
-            echo "当前规则:"
-            nl -w3 -s': ' "$RULES_FILE"
-            read -p "输入要删除的规则号: " num
-            sed -i "${num}d" "$RULES_FILE"
-            ;;
-        2)
-            > "$RULES_FILE"
-            echo "所有规则已删除"
-            ;;
+    # 选择协议
+    echo "请选择协议类型:"
+    echo "1) TCP"
+    echo "2) UDP"
+    echo "3) 同时支持TCP和UDP"
+    read -p "请输入选项 [1-3, 默认1]: " proto_choice
+    proto_choice=${proto_choice:-1}
+    
+    case $proto_choice in
+        1) proto="tcp" ;;
+        2) proto="udp" ;;
+        3) proto="both" ;;
+        *) echo "无效选项"; return ;;
     esac
-}
-
-# 查看状态
-status() {
-    echo "===== 活动转发进程 ====="
-    pgrep -lf socat | grep -v "socat.sh"
     
-    echo -e "\n===== 配置规则 ====="
-    [ -s "$RULES_FILE" ] && cat -n "$RULES_FILE" || echo "无配置规则"
+    # 输入本地端口
+    while true; do
+        read -p "请输入本地监听端口 [1-65535]: " local_port
+        if [[ $local_port =~ ^[0-9]+$ ]] && [ $local_port -ge 1 ] && [ $local_port -le 65535 ]; then
+            break
+        else
+            echo "无效的端口号，请重新输入"
+        fi
+    done
+    
+    # 输入远程主机
+    read -p "请输入远程主机IP或域名: " remote_host
+    if [ -z "$remote_host" ]; then
+        echo "远程主机不能为空"
+        return
+    fi
+    
+    # 输入远程端口
+    while true; do
+        read -p "请输入远程端口 [1-65535]: " remote_port
+        if [[ $remote_port =~ ^[0-9]+$ ]] && [ $remote_port -ge 1 ] && [ $remote_port -le 65535 ]; then
+            break
+        else
+            echo "无效的端口号，请重新输入"
+        fi
+    done
+    
+    # 获取规则ID并添加到文件
+    rule_id=$(get_next_id)
+    echo "$rule_id $proto $local_port $remote_host $remote_port" >> $RULES_FILE
+    echo "规则添加成功 (ID: $rule_id)"
+    
+    # 立即启动该规则
+    start_single_rule $rule_id
 }
 
-# 创建系统服务
-create_service() {
-    cat > /etc/init.d/socat-forward <<EOF
-#!/sbin/openrc-run
-name="socat-forward"
-description="Socat port forwarding service"
-
-pidfile="/var/run/\$RC_SVCNAME.pid"
-command="/usr/local/bin/socat-forward"
-command_args="--start"
-command_background=true
-
-depend() {
-    need net
+# 显示所有规则
+show_rules() {
+    echo "===== 当前转发规则 ====="
+    echo "ID  协议      本地端口 -> 远程主机:端口"
+    echo "----------------------------------------"
+    
+    if [ ! -s $RULES_FILE ]; then
+        echo "没有任何转发规则"
+        return
+    fi
+    
+    while IFS= read -r rule; do
+        # 跳过空行和注释
+        [ -z "$rule" ] || [ "${rule#\#}" != "$rule" ] && continue
+        
+        id=$(echo "$rule" | awk '{print $1}')
+        proto=$(echo "$rule" | awk '{print $2}')
+        local_port=$(echo "$rule" | awk '{print $3}')
+        remote_host=$(echo "$rule" | awk '{print $4}')
+        remote_port=$(echo "$rule" | awk '{print $5}')
+        
+        # 格式化协议显示
+        case $proto in
+            tcp) proto_display="TCP       " ;;
+            udp) proto_display="UDP       " ;;
+            both) proto_display="TCP+UDP   " ;;
+        esac
+        
+        echo "$id   $proto_display $local_port -> $remote_host:$remote_port"
+    done < $RULES_FILE
 }
-EOF
 
-    chmod +x /etc/init.d/socat-forward
-    rc-update add socat-forward default >/dev/null
-    echo "系统服务已创建: 开机自动启动"
+# 删除指定规则
+delete_rule() {
+    show_rules
+    if [ ! -s $RULES_FILE ]; then
+        return
+    fi
+    
+    read -p "请输入要删除的规则ID: " rule_id
+    if [ -z "$rule_id" ] || ! [[ $rule_id =~ ^[0-9]+$ ]]; then
+        echo "无效的规则ID"
+        return
+    fi
+    
+    # 检查规则是否存在
+    if ! grep -q "^$rule_id " $RULES_FILE; then
+        echo "规则ID $rule_id 不存在"
+        return
+    fi
+    
+    # 停止该规则的进程
+    stop_single_rule $rule_id
+    
+    # 从规则文件中删除
+    sed -i "/^$rule_id /d" $RULES_FILE
+    echo "规则ID $rule_id 已删除"
+}
+
+# 清空所有规则
+clear_all_rules() {
+    if [ ! -s $RULES_FILE ]; then
+        echo "没有任何规则可清除"
+        return
+    fi
+    
+    read -p "确定要删除所有转发规则吗? [y/N]: " confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        # 停止所有进程
+        stop_all_rules
+        
+        # 清空规则文件
+        > $RULES_FILE
+        echo "所有规则已清除"
+    else
+        echo "操作已取消"
+    fi
+}
+
+# 启动单个规则
+start_single_rule() {
+    local rule_id=$1
+    local rule=$(grep "^$rule_id " $RULES_FILE)
+    
+    if [ -z "$rule" ]; then
+        echo "规则ID $rule_id 不存在"
+        return
+    fi
+    
+    proto=$(echo "$rule" | awk '{print $2}')
+    local_port=$(echo "$rule" | awk '{print $3}')
+    remote_host=$(echo "$rule" | awk '{print $4}')
+    remote_port=$(echo "$rule" | awk '{print $5}')
+    
+    # 启动TCP转发
+    if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
+        if ! pgrep -F $PID_DIR/socat-tcp-$rule_id.pid >/dev/null 2>&1; then
+            socat TCP4-LISTEN:$local_port,reuseaddr,fork TCP4:$remote_host:$remote_port &
+            echo $! > $PID_DIR/socat-tcp-$rule_id.pid
+            echo "已启动 TCP 转发: $local_port -> $remote_host:$remote_port"
+        else
+            echo "TCP 转发 $local_port -> $remote_host:$remote_port 已在运行"
+        fi
+    fi
+    
+    # 启动UDP转发
+    if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
+        if ! pgrep -F $PID_DIR/socat-udp-$rule_id.pid >/dev/null 2>&1; then
+            socat UDP4-LISTEN:$local_port,reuseaddr,fork UDP4:$remote_host:$remote_port &
+            echo $! > $PID_DIR/socat-udp-$rule_id.pid
+            echo "已启动 UDP 转发: $local_port -> $remote_host:$remote_port"
+        else
+            echo "UDP 转发 $local_port -> $remote_host:$remote_port 已在运行"
+        fi
+    fi
+}
+
+# 停止单个规则
+stop_single_rule() {
+    local rule_id=$1
+    
+    # 停止TCP进程
+    if [ -f $PID_DIR/socat-tcp-$rule_id.pid ]; then
+        if pgrep -F $PID_DIR/socat-tcp-$rule_id.pid >/dev/null 2>&1; then
+            kill $(cat $PID_DIR/socat-tcp-$rule_id.pid) >/dev/null 2>&1
+        fi
+        rm -f $PID_DIR/socat-tcp-$rule_id.pid
+    fi
+    
+    # 停止UDP进程
+    if [ -f $PID_DIR/socat-udp-$rule_id.pid ]; then
+        if pgrep -F $PID_DIR/socat-udp-$rule_id.pid >/dev/null 2>&1; then
+            kill $(cat $PID_DIR/socat-udp-$rule_id.pid) >/dev/null 2>&1
+        fi
+        rm -f $PID_DIR/socat-udp-$rule_id.pid
+    fi
+}
+
+# 启动所有规则
+start_all_rules() {
+    $SERVICE_FILE start
+}
+
+# 停止所有规则
+stop_all_rules() {
+    $SERVICE_FILE stop
+}
+
+# 重启所有规则
+restart_all_rules() {
+    $SERVICE_FILE restart
+}
+
+# 设置开机启动
+enable_boot_start() {
+    rc-update add socat-forward default
+    echo "已设置 socat 转发服务开机自启"
+}
+
+# 取消开机启动
+disable_boot_start() {
+    rc-update del socat-forward default
+    echo "已取消 socat 转发服务开机自启"
 }
 
 # 主菜单
-menu() {
-    echo -e "\n===== Socat转发管理器 ====="
-    echo "1) 添加转发规则"
-    echo "2) 启动所有转发"
-    echo "3) 停止所有转发"
-    echo "4) 重启所有转发"
-    echo "5) 删除转发规则"
-    echo "6) 查看当前状态"
-    echo "7) 创建开机服务"
-    echo "8) 退出"
+show_menu() {
+    clear
+    echo "======================================"
+    echo "      Socat 端口转发管理工具          "
+    echo "           Alpine Linux 版            "
+    echo "======================================"
+    echo "1. 添加新转发规则"
+    echo "2. 查看所有转发规则"
+    echo "3. 删除指定转发规则"
+    echo "4. 清空所有转发规则"
+    echo "--------------------------------------"
+    echo "5. 启动所有转发规则"
+    echo "6. 停止所有转发规则"
+    echo "7. 重启所有转发规则"
+    echo "--------------------------------------"
+    echo "8. 设置开机自启动"
+    echo "9. 取消开机自启动"
+    echo "--------------------------------------"
+    echo "0. 退出"
+    echo "======================================"
+    read -p "请输入操作选项 [0-9]: " choice
 }
 
-# 参数处理
-case "$1" in
-    --start) start_all; exit ;;
-    --stop) stop_all; exit ;;
-    --restart) stop_all; start_all; exit ;;
-    *) ;;
-esac
+# 主程序
+main() {
+    # 检查是否以root权限运行
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "错误: 此脚本需要以root权限运行"
+        exit 1
+    fi
+    
+    # 初始化环境
+    init_env
+    
+    # 安装socat
+    install_socat
+    
+    # 主循环
+    while true; do
+        show_menu
+        case $choice in
+            1) add_rule ;;
+            2) show_rules ;;
+            3) delete_rule ;;
+            4) clear_all_rules ;;
+            5) start_all_rules ;;
+            6) stop_all_rules ;;
+            7) restart_all_rules ;;
+            8) enable_boot_start ;;
+            9) disable_boot_start ;;
+            0) echo "再见!"; exit 0 ;;
+            *) echo "无效选项，请重新输入" ;;
+        esac
+        echo
+        read -p "按回车键继续..." -n 1
+    done
+}
 
-# 初始化环境
-init
-
-# 显示菜单
-while true; do
-    menu
-    read -p "请选择操作: " choice
-    case $choice in
-        1) add_rule ;;
-        2) start_all ;;
-        3) stop_all ;;
-        4) stop_all; start_all ;;
-        5) delete_rules ;;
-        6) status ;;
-        7) create_service ;;
-        8) exit 0 ;;
-        *) echo "无效选择!" ;;
-    esac
-done
+# 启动主程序
+main
