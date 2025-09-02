@@ -1,5 +1,5 @@
 #!/bin/sh
-# Socat端口转发一键管理脚本 (Alpine Linux专用) - ash兼容版
+# Socat端口转发一键管理脚本 (Alpine Linux专用) - 完全兼容版
 # 支持TCP/UDP协议，规则持久化，多端口转发
 
 # 配置变量
@@ -71,7 +71,7 @@ EOF
     fi
 }
 
-# 安装必要工具（使用ash兼容语法）
+# 安装必要工具（完全兼容ash语法）
 install_dependencies() {
     echo "正在检查并安装必要工具..."
     
@@ -105,6 +105,14 @@ is_port_in_use() {
     else
         return 1  # 端口未占用
     fi
+}
+
+# 检查是否为数字
+is_number() {
+    local str=$1
+    # 使用grep检查是否为纯数字
+    echo "$str" | grep -q '^[0-9]\+$'
+    return $?
 }
 
 # 获取下一个规则ID
@@ -197,7 +205,8 @@ add_rule() {
     # 输入本地端口
     while true; do
         read -p "请输入本地监听端口 [1-65535]: " local_port
-        if [[ $local_port =~ ^[0-9]+$ ]] && [ $local_port -ge 1 ] && [ $local_port -le 65535 ]; then
+        # 使用ash兼容的方式检查是否为数字
+        if is_number "$local_port" && [ $local_port -ge 1 ] && [ $local_port -le 65535 ]; then
             # 检查端口是否已被占用
             if is_port_in_use $local_port; then
                 echo "端口 $local_port 已被占用，请选择其他端口"
@@ -219,7 +228,8 @@ add_rule() {
     # 输入远程端口
     while true; do
         read -p "请输入远程端口 [1-65535]: " remote_port
-        if [[ $remote_port =~ ^[0-9]+$ ]] && [ $remote_port -ge 1 ] && [ $remote_port -le 65535 ]; then
+        # 使用ash兼容的方式检查是否为数字
+        if is_number "$remote_port" && [ $remote_port -ge 1 ] && [ $remote_port -le 65535 ]; then
             break
         else
             echo "无效的端口号，请重新输入"
@@ -278,7 +288,7 @@ delete_rule() {
     fi
     
     read -p "请输入要删除的规则ID: " rule_id
-    if [ -z "$rule_id" ] || ! [[ $rule_id =~ ^[0-9]+$ ]]; then
+    if [ -z "$rule_id" ] || ! is_number "$rule_id"; then
         echo "无效的规则ID"
         return
     fi
