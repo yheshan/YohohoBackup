@@ -1,5 +1,5 @@
 #!/bin/sh
-# Socat 端口转发管理脚本 (数字选择版)
+# Socat 端口转发管理脚本 (修复版)
 # 支持 TCP/UDP/加密隧道，自动后台运行和开机启动
 
 # 配置存储路径
@@ -15,6 +15,7 @@ init_env() {
     # 创建配置目录和规则文件
     mkdir -p $CONFIG_DIR
     [ -f "$RULES_FILE" ] || touch "$RULES_FILE"
+    chmod +x "$RULES_FILE"
     
     # 创建服务文件（OpenRC）
     if [ ! -f "$SERVICE_FILE" ]; then
@@ -29,18 +30,39 @@ depend() {
 
 start() {
     ebegin "Starting socat forward rules"
-    /etc/socat-forward/rules.conf start >/dev/null 2>&1
+    . /etc/socat-forward/rules.conf
+    start_all_rules
     eend $?
 }
 
 stop() {
     ebegin "Stopping socat forward rules"
-    /etc/socat-forward/rules.conf stop >/dev/null 2>&1
+    . /etc/socat-forward/rules.conf
+    stop_all_rules
     eend $?
 }
 EOF
         chmod +x "$SERVICE_FILE"
         rc-update add socat-forward default >/dev/null 2>&1
+    fi
+    
+    # 确保规则文件包含必要的函数
+    if ! grep -q "start_all_rules" "$RULES_FILE"; then
+        cat >> "$RULES_FILE" << 'EOF'
+
+# 批量管理函数
+start_all_rules() {
+    for rule in $(grep -oE 'rule_[0-9]+' "$0" | sort -u); do
+        $rule start
+    done
+}
+
+stop_all_rules() {
+    for rule in $(grep -oE 'rule_[0-9]+' "$0" | sort -u); do
+        $rule stop
+    done
+}
+EOF
     fi
 }
 
@@ -48,7 +70,8 @@ EOF
 show_rules() {
     echo -e "\n===== 当前转发规则 ====="
     if [ -s "$RULES_FILE" ]; then
-        grep -vE '^$|^#' "$RULES_FILE" | nl -w2 -s') '
+        # 只显示规则注释行，过滤函数定义
+        grep -E '^# TCP|^# UDP|^# SSL-TCP' "$RULES_FILE" | nl -w2 -s') '
     else
         echo "没有配置任何转发规则"
     fi
@@ -124,7 +147,9 @@ rule_$rule_id() {
 EOF
 
     echo "规则添加成功！ID: $rule_id"
-    rule_$rule_id start  # 立即启动
+    # 加载规则并启动
+    . "$RULES_FILE"
+    rule_$rule_id start
     read -p "按回车键返回主菜单..."
 }
 
@@ -138,18 +163,23 @@ delete_rule() {
         return 1
     fi
 
-    # 获取对应规则ID
-    rule_id=$(grep -vE '^$|^#' "$RULES_FILE" | sed -n "${rule_num}p" | grep -oE 'rule_[0-9]+' | head -n1 | cut -d'_' -f2)
-    if [ -z "$rule_id" ]; then
+    # 获取对应规则行和ID
+    rule_line=$(grep -E '^# TCP|^# UDP|^# SSL-TCP' "$RULES_FILE" | sed -n "${rule_num}p")
+    if [ -z "$rule_line" ]; then
         echo "无效的规则序号"
         read -p "按回车键返回主菜单..."
         return 1
     fi
 
-    # 停止并删除规则
+    # 提取规则ID
+    rule_id=$(echo "$rule_line" | grep -oE '[0-9]+' | tail -n1)
+    
+    # 加载规则并停止
+    . "$RULES_FILE"
     rule_$rule_id stop
-    sed -i "/rule_$rule_id(),\{0,1\}/,/^}/d" "$RULES_FILE"  # 删除规则块
-    sed -i "/^#.*rule_$rule_id/d" "$RULES_FILE"  # 删除注释行
+    
+    # 删除规则
+    sed -i "/#.*$rule_id/,+5d" "$RULES_FILE"  # 删除规则注释和函数
     echo "规则 $rule_num (ID: $rule_id) 已删除"
     read -p "按回车键返回主菜单..."
 }
@@ -158,11 +188,19 @@ delete_rule() {
 clear_all() {
     read -p "确定要删除所有规则吗？[y/N] " confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        # 停止所有规则
-        $RULES_FILE stop
+        # 保存批量管理函数
+        temp_file=$(mktemp)
+        grep -A 10 "start_all_rules" "$RULES_FILE" > "$temp_file"
         
-        # 清空规则文件
+        # 清空规则文件并恢复批量管理函数
         > "$RULES_FILE"
+        cat "$temp_file" >> "$RULES_FILE"
+        rm -f "$temp_file"
+        
+        # 停止所有进程
+        rm -f "$CONFIG_DIR"/*.pid
+        pkill -f "socat (TCP|UDP|OPENSSL)-LISTEN" >/dev/null 2>&1
+        
         echo "所有规则已清空"
     else
         echo "取消操作"
@@ -173,18 +211,14 @@ clear_all() {
 # 启动/停止所有规则
 control_rules() {
     action=$1
+    . "$RULES_FILE"  # 加载规则定义
+    
     if [ "$action" = "start" ]; then
         echo "启动所有转发规则..."
-        # 逐个启动规则
-        grep -oE 'rule_[0-9]+' "$RULES_FILE" | sort -u | while read -r rule; do
-            $rule start
-        done
+        start_all_rules
     elif [ "$action" = "stop" ]; then
         echo "停止所有转发规则..."
-        # 逐个停止规则
-        grep -oE 'rule_[0-9]+' "$RULES_FILE" | sort -u | while read -r rule; do
-            $rule stop
-        done
+        stop_all_rules
     fi
     read -p "按回车键返回主菜单..."
 }
@@ -210,7 +244,6 @@ show_menu() {
 # 主逻辑
 main() {
     init_env  # 初始化环境
-    chmod +x "$RULES_FILE"  # 确保规则文件可执行
     
     while true; do
         show_menu
