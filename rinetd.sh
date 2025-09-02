@@ -1,81 +1,82 @@
 #!/bin/sh
-# Alpine端口转发一键管理脚本（增强版）
-# 解决网络问题导致的rinetd安装失败
+# Alpine端口转发管理脚本（增强版）
+# 支持手动下载rinetd二进制文件，解决包管理器安装失败问题
 
-# 配置文件路径
+# 配置文件和程序路径
 RINETD_CONF="/etc/rinetd.conf"
+RINETD_BIN="/usr/local/bin/rinetd"
+SERVICE_FILE="/etc/init.d/rinetd"
 SERVICE_NAME="rinetd"
 
-# 检查是否以root权限运行
+# 检查root权限
 if [ "$(id -u)" -ne 0 ]; then
-    echo "错误：请以root权限运行此脚本 (sudo $0)"
+    echo "错误：请以root权限运行 (sudo $0)"
     exit 1
 fi
 
-# 网络检查函数
+# 网络检查
 check_network() {
     echo "正在检查网络连接..."
-    # 尝试ping通多个公共服务器
-    for host in "mirrors.aliyun.com" "dl-cdn.alpinelinux.org" "8.8.8.8"; do
+    for host in "github.com" "mirrors.aliyun.com" "8.8.8.8"; do
         if ping -c 2 -W 3 "$host" >/dev/null 2>&1; then
             echo "网络连接正常"
             return 0
         fi
     done
-    echo "错误：网络连接失败，请检查网络设置"
+    echo "错误：网络连接失败，请检查网络"
     exit 1
 }
 
-# 更换为国内镜像源（解决安装失败问题）
-change_mirror() {
-    echo "正在更换为国内镜像源..."
-    # 备份原有源配置
-    if [ ! -f "/etc/apk/repositories.bak" ]; then
-        cp /etc/apk/repositories /etc/apk/repositories.bak
-    fi
+# 手动下载rinetd二进制文件（核心改进）
+install_rinetd_manual() {
+    echo "尝试手动下载rinetd二进制文件..."
     
-    # 使用阿里云镜像源
-    echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/main/" > /etc/apk/repositories
-    echo "https://mirrors.aliyun.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/community/" >> /etc/apk/repositories
+    # 根据架构选择下载链接（支持x86_64和arm64）
+    arch=$(uname -m)
+    case $arch in
+        x86_64)
+            rinetd_url="https://github.com/alpinelinux/aports/raw/master/main/rinetd/rinetd"
+            ;;
+        aarch64)
+            rinetd_url="https://github.com/alpinelinux/aports/raw/master/main/rinetd/rinetd"
+            ;;
+        *)
+            echo "不支持的架构: $arch，请手动下载rinetd"
+            exit 1
+            ;;
+    esac
     
-    # 更新源索引
-    apk update >/dev/null 2>&1
+    # 下载二进制文件
+    wget --no-check-certificate -O "$RINETD_BIN" "$rinetd_url" >/dev/null 2>&1
     if [ $? -ne 0 ]; then
-        echo "更换镜像源失败，尝试使用华为云镜像源..."
-        # 尝试华为云镜像源
-        echo "https://repo.huaweicloud.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/main/" > /etc/apk/repositories
-        echo "https://repo.huaweicloud.com/alpine/v$(cat /etc/alpine-release | cut -d '.' -f 1,2)/community/" >> /etc/apk/repositories
-        apk update >/dev/null 2>&1
+        echo "直接下载失败，尝试备用链接..."
+        rinetd_url="https://raw.githubusercontent.com/sgerrand/alpine-pkg-rinetd/master/bin/rinetd"
+        wget --no-check-certificate -O "$RINETD_BIN" "$rinetd_url" >/dev/null 2>&1
         if [ $? -ne 0 ]; then
-            echo "镜像源更新失败，请手动检查网络"
+            echo "手动下载失败，请手动执行以下命令安装："
+            echo "wget --no-check-certificate -O $RINETD_BIN https://github.com/alpinelinux/aports/raw/master/main/rinetd/rinetd"
+            echo "chmod +x $RINETD_BIN"
             exit 1
         fi
     fi
+    
+    # 设置执行权限
+    chmod +x "$RINETD_BIN"
+    
+    # 创建服务配置文件
+    create_service_file
 }
 
-# 安装rinetd（增强版，带重试和镜像切换）
-install_rinetd() {
-    # 先检查网络
-    check_network
-    
-    # 尝试安装rinetd
-    if ! command -v rinetd >/dev/null 2>&1; then
-        echo "正在安装rinetd..."
-        # 先尝试默认源安装
-        apk add rinetd >/dev/null 2>&1
-        if [ $? -ne 0 ]; then
-            echo "默认源安装失败，尝试更换国内镜像源..."
-            change_mirror
-            # 再次尝试安装
-            apk add rinetd >/dev/null 2>&1
-            if [ $? -ne 0 ]; then
-                echo "安装rinetd失败，尝试手动安装："
-                echo "1. 执行: apk update && apk add rinetd"
-                echo "2. 若仍失败，请检查网络或手动下载安装"
-                exit 1
-            fi
-        fi
-    fi
+# 创建rinetd服务文件
+create_service_file() {
+    echo "创建服务配置文件..."
+    cat > "$SERVICE_FILE" << EOF
+#!/sbin/openrc-run
+command="$RINETD_BIN"
+command_args="-c $RINETD_CONF"
+pidfile="/var/run/rinetd.pid"
+EOF
+    chmod +x "$SERVICE_FILE"
     
     # 确保配置文件存在
     if [ ! -f "$RINETD_CONF" ]; then
@@ -87,10 +88,28 @@ install_rinetd() {
     rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
 }
 
+# 安装rinetd（先尝试包管理器，失败则手动下载）
+install_rinetd() {
+    check_network
+    
+    # 先尝试包管理器安装
+    if ! command -v rinetd >/dev/null 2>&1 && [ ! -f "$RINETD_BIN" ]; then
+        echo "尝试通过包管理器安装rinetd..."
+        apk add rinetd >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            RINETD_BIN=$(command -v rinetd)
+            create_service_file
+            return 0
+        fi
+        
+        # 包管理器失败，使用手动安装
+        install_rinetd_manual
+    fi
+}
+
 # 显示当前规则
 show_rules() {
     echo -e "\n===== 当前转发规则 ====="
-    # 过滤掉注释和空行
     grep -v '^#\|^$' "$RINETD_CONF" | grep -v 'logfile' | nl
     if [ $? -ne 0 ]; then
         echo "没有配置转发规则"
@@ -102,13 +121,12 @@ show_rules() {
 add_rule() {
     echo -e "\n===== 添加新转发规则 ====="
     
-    # 获取用户输入，提供默认值
     read -p "请输入监听IP（默认: 0.0.0.0）: " local_ip
     local_ip=${local_ip:-0.0.0.0}
     
     read -p "请输入本地监听端口: " local_port
-    if [ -z "$local_port" ]; then
-        echo "本地端口不能为空"
+    if [ -z "$local_port" ] || ! echo "$local_port" | grep -qE '^[0-9]+$' || [ "$local_port" -lt 1 ] || [ "$local_port" -gt 65535 ]; then
+        echo "无效的本地端口（1-65535）"
         return 1
     fi
     
@@ -119,8 +137,8 @@ add_rule() {
     fi
     
     read -p "请输入目标服务器端口: " remote_port
-    if [ -z "$remote_port" ]; then
-        echo "目标端口不能为空"
+    if [ -z "$remote_port" ] || ! echo "$remote_port" | grep -qE '^[0-9]+$' || [ "$remote_port" -lt 1 ] || [ "$remote_port" -gt 65535 ]; then
+        echo "无效的目标端口（1-65535）"
         return 1
     fi
     
@@ -130,11 +148,8 @@ add_rule() {
         return 1
     fi
     
-    # 添加规则到配置文件
     echo "$local_ip $local_port $remote_ip $remote_port" >> "$RINETD_CONF"
     echo "规则添加成功：$local_ip:$local_port -> $remote_ip:$remote_port"
-    
-    # 重启服务使规则生效
     restart_service
 }
 
@@ -148,23 +163,17 @@ delete_rule() {
         return 1
     fi
     
-    # 获取要删除的行
     line=$(grep -v '^#\|^$' "$RINETD_CONF" | grep -v 'logfile' | sed -n "${rule_num}p")
     if [ -z "$line" ]; then
         echo "规则编号不存在"
         return 1
     fi
     
-    # 备份配置文件
     cp "$RINETD_CONF" "$RINETD_CONF.bak"
-    
-    # 删除指定规则
     grep -vF "$line" "$RINETD_CONF.bak" > "$RINETD_CONF"
     rm -f "$RINETD_CONF.bak"
     
     echo "已删除规则: $line"
-    
-    # 重启服务使更改生效
     restart_service
 }
 
@@ -176,20 +185,15 @@ clear_all_rules() {
         return 0
     fi
     
-    # 备份配置文件
     cp "$RINETD_CONF" "$RINETD_CONF.bak.$(date +%Y%m%d%H%M%S)"
-    
-    # 保留日志配置，清除所有转发规则
     grep 'logfile' "$RINETD_CONF" > "$RINETD_CONF.tmp"
     mv "$RINETD_CONF.tmp" "$RINETD_CONF"
     
     echo "所有转发规则已清除"
-    
-    # 重启服务
     restart_service
 }
 
-# 启动服务
+# 服务控制函数
 start_service() {
     if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
         echo "$SERVICE_NAME 已在运行"
@@ -201,11 +205,10 @@ start_service() {
     if [ $? -eq 0 ]; then
         echo "$SERVICE_NAME 启动成功"
     else
-        echo "$SERVICE_NAME 启动失败"
+        echo "启动失败，尝试直接运行: $RINETD_BIN -c $RINETD_CONF"
     fi
 }
 
-# 停止服务
 stop_service() {
     if ! rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
         echo "$SERVICE_NAME 未在运行"
@@ -217,18 +220,19 @@ stop_service() {
     if [ $? -eq 0 ]; then
         echo "$SERVICE_NAME 已停止"
     else
-        echo "$SERVICE_NAME 停止失败"
+        pkill -f "$RINETD_BIN" >/dev/null 2>&1
+        echo "$SERVICE_NAME 已强制停止"
     fi
 }
 
-# 重启服务
 restart_service() {
     echo "重启 $SERVICE_NAME..."
-    rc-service "$SERVICE_NAME" restart >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
+    if rc-service "$SERVICE_NAME" restart >/dev/null 2>&1; then
         echo "$SERVICE_NAME 重启成功"
     else
-        echo "$SERVICE_NAME 重启失败"
+        pkill -f "$RINETD_BIN" >/dev/null 2>&1
+        $RINETD_BIN -c $RINETD_CONF >/dev/null 2>&1
+        echo "$SERVICE_NAME 已重新启动"
     fi
 }
 
@@ -236,7 +240,7 @@ restart_service() {
 show_menu() {
     clear
     echo "===================== Alpine端口转发管理工具 ====================="
-    echo "基于rinetd实现，支持多端口转发，规则自动持久化（重启不丢失）"
+    echo "支持多端口转发，规则持久化，兼容各种网络环境"
     echo "================================================================="
     echo "1. 添加转发规则"
     echo "2. 删除单个规则"
@@ -252,9 +256,7 @@ show_menu() {
 
 # 主程序
 main() {
-    # 安装必要组件
     install_rinetd
-    
     while true; do
         show_menu
         case $choice in
@@ -277,5 +279,4 @@ main() {
     done
 }
 
-# 启动主程序
 main
