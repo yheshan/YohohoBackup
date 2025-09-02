@@ -1,7 +1,7 @@
 #!/bin/bash
-# 多功能端口转发脚本
-# 支持 iptables、socat、nftables
-# 支持 TCP、UDP、TCP+UDP、加密隧道
+# 简化版端口转发脚本
+# 仅支持 iptables 和 socat
+# 支持 TCP、UDP、TCP+UDP
 # 配置自动持久化，重启后生效
 
 # 配置文件路径
@@ -16,7 +16,7 @@ mkdir -p $CONFIG_DIR
 if [ ! -f $CONFIG_FILE ]; then
     echo "# 转发规则配置文件" > $CONFIG_FILE
     echo "# 格式: 工具类型 协议 本地端口 目标IP 目标端口 备注" >> $CONFIG_FILE
-    echo "# 工具类型: iptables, socat, nftables, ssh_tunnel" >> $CONFIG_FILE
+    echo "# 工具类型: iptables, socat" >> $CONFIG_FILE
     echo "# 协议: tcp, udp, tcp+udp" >> $CONFIG_FILE
 fi
 
@@ -46,7 +46,7 @@ EOF
 show_menu() {
     clear
     echo "============================================="
-    echo "           多功能端口转发管理脚本            "
+    echo "           端口转发管理脚本 (精简版)         "
     echo "============================================="
     echo "1. 添加新转发规则"
     echo "2. 查看所有转发规则"
@@ -70,15 +70,11 @@ add_rule() {
     echo "选择转发工具:"
     echo "1. iptables (简单端口转发，性能好)"
     echo "2. socat (灵活，支持多种转发类型)"
-    echo "3. nftables (新一代防火墙，支持复杂规则)"
-    echo "4. ssh_tunnel (加密隧道转发)"
-    read -p "请选择 [1-4]: " tool_choice
+    read -p "请选择 [1-2]: " tool_choice
     
     case $tool_choice in
         1) tool="iptables" ;;
         2) tool="socat" ;;
-        3) tool="nftables" ;;
-        4) tool="ssh_tunnel" ;;
         *) echo "无效选择"; sleep 2; return ;;
     esac
     
@@ -102,19 +98,8 @@ add_rule() {
     read -p "请输入目标端口: " dest_port
     read -p "请输入备注(可选): " comment
     
-    # 特殊处理ssh隧道
-    if [ "$tool" = "ssh_tunnel" ]; then
-        read -p "请输入SSH服务器用户名@IP: " ssh_server
-        read -p "是否使用密钥认证? (y/n，默认n): " use_key
-        [ "$use_key" = "y" ] && read -p "请输入私钥路径(默认~/.ssh/id_rsa): " key_path
-    fi
-    
     # 保存规则到配置文件
     echo "$tool $proto $local_port $dest_ip $dest_port $comment" >> $CONFIG_FILE
-    if [ "$tool" = "ssh_tunnel" ]; then
-        echo "  ssh_server=$ssh_server" >> $CONFIG_FILE
-        [ "$use_key" = "y" ] && echo "  key_path=${key_path:-~/.ssh/id_rsa}" >> $CONFIG_FILE
-    fi
     
     echo -e "\n规则已添加，编号为: $(grep -c '^[^#]' $CONFIG_FILE)"
     read -p "是否立即启动该规则? (y/n): " start_now
@@ -137,25 +122,22 @@ show_rules() {
         # 跳过注释和空行
         [[ $line =~ ^# || -z $line ]] && continue
         
-        # 处理常规规则行
-        if [[ ! $line =~ ^[[:space:]] ]]; then
-            ((rule_num++))
-            tool=$(echo $line | awk '{print $1}')
-            proto=$(echo $line | awk '{print $2}')
-            local_port=$(echo $line | awk '{print $3}')
-            dest_ip=$(echo $line | awk '{print $4}')
-            dest_port=$(echo $line | awk '{print $5}')
-            comment=$(echo $line | awk '{$1=$2=$3=$4=$5=""; print $0}' | xargs)
-            
-            # 检查规则是否正在运行
-            status="停止"
-            if is_running $rule_num; then
-                status="运行中"
-            fi
-            
-            printf "%-5d %-10s %-9s %-5s -> %-15s:%-5s  %s (状态: %s)\n" \
-                $rule_num $tool $proto $local_port $dest_ip $dest_port "$comment" "$status"
+        ((rule_num++))
+        tool=$(echo $line | awk '{print $1}')
+        proto=$(echo $line | awk '{print $2}')
+        local_port=$(echo $line | awk '{print $3}')
+        dest_ip=$(echo $line | awk '{print $4}')
+        dest_port=$(echo $line | awk '{print $5}')
+        comment=$(echo $line | awk '{$1=$2=$3=$4=$5=""; print $0}' | xargs)
+        
+        # 检查规则是否正在运行
+        status="停止"
+        if is_running $rule_num; then
+            status="运行中"
         fi
+        
+        printf "%-5d %-10s %-9s %-5s -> %-15s:%-5s  %s (状态: %s)\n" \
+            $rule_num $tool $proto $local_port $dest_ip $dest_port "$comment" "$status"
     done < $CONFIG_FILE
     
     echo "============================================="
@@ -183,14 +165,6 @@ is_running() {
             pgrep -f "socat .*LISTEN:$local_port" >/dev/null 2>&1
             if [ $? -eq 0 ]; then return 0; fi
             ;;
-        nftables)
-            nft list ruleset | grep "dport $local_port" | grep "dnat to $dest_ip:$dest_port" >/dev/null 2>&1
-            if [ $? -eq 0 ]; then return 0; fi
-            ;;
-        ssh_tunnel)
-            pgrep -f "ssh .* -L $local_port:$dest_ip:$dest_port" >/dev/null 2>&1
-            if [ $? -eq 0 ]; then return 0; fi
-            ;;
     esac
     return 1
 }
@@ -205,34 +179,20 @@ get_rule() {
     dest_ip=""
     dest_port=""
     comment=""
-    ssh_server=""
-    key_path=""
     
     current_num=0
     while IFS= read -r line; do
         [[ $line =~ ^# || -z $line ]] && continue
         
-        if [[ ! $line =~ ^[[:space:]] ]]; then
-            ((current_num++))
-            if [ $current_num -eq $rule_num ]; then
-                tool=$(echo $line | awk '{print $1}')
-                proto=$(echo $line | awk '{print $2}')
-                local_port=$(echo $line | awk '{print $3}')
-                dest_ip=$(echo $line | awk '{print $4}')
-                dest_port=$(echo $line | awk '{print $5}')
-                comment=$(echo $line | awk '{$1=$2=$3=$4=$5=""; print $0}' | xargs)
-            elif [ $current_num -gt $rule_num ]; then
-                break
-            fi
-        else
-            # 处理缩进的附加参数
-            if [ $current_num -eq $rule_num ]; then
-                if [[ $line =~ ssh_server= ]]; then
-                    ssh_server=$(echo $line | sed 's/.*ssh_server=//')
-                elif [[ $line =~ key_path= ]]; then
-                    key_path=$(echo $line | sed 's/.*key_path=//')
-                fi
-            fi
+        ((current_num++))
+        if [ $current_num -eq $rule_num ]; then
+            tool=$(echo $line | awk '{print $1}')
+            proto=$(echo $line | awk '{print $2}')
+            local_port=$(echo $line | awk '{print $3}')
+            dest_ip=$(echo $line | awk '{print $4}')
+            dest_port=$(echo $line | awk '{print $5}')
+            comment=$(echo $line | awk '{$1=$2=$3=$4=$5=""; print $0}' | xargs)
+            break
         fi
     done < $CONFIG_FILE
 }
@@ -295,56 +255,6 @@ start_rule() {
                 echo $! > $CONFIG_DIR/socat_udp_$local_port.pid
             fi
             ;;
-            
-        nftables)
-            # 安装nftables（如果未安装）
-            if ! command -v nft &> /dev/null; then
-                echo "正在安装nftables..."
-                apk add --no-cache nftables
-                rc-update add nftables default
-                service nftables start
-            fi
-            
-            # 启用IP转发
-            echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-            sysctl -p >/dev/null
-            
-            # 创建表和链（如果不存在）
-            nft add table ip nat 2>/dev/null
-            nft add chain ip nat prerouting '{ type nat hook prerouting priority 0; policy accept; }' 2>/dev/null
-            nft add chain ip nat postrouting '{ type nat hook postrouting priority 100; policy accept; }' 2>/dev/null
-            
-            # 添加TCP规则
-            if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ]; then
-                nft add rule ip nat prerouting tcp dport $local_port dnat to $dest_ip:$dest_port
-                nft add rule ip nat postrouting ip daddr $dest_ip tcp dport $dest_port masquerade
-            fi
-            
-            # 添加UDP规则
-            if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ]; then
-                nft add rule ip nat prerouting udp dport $local_port dnat to $dest_ip:$dest_port
-                nft add rule ip nat postrouting ip daddr $dest_ip udp dport $dest_port masquerade
-            fi
-            
-            # 保存规则
-            nft list ruleset > /etc/nftables.conf
-            ;;
-            
-        ssh_tunnel)
-            # 安装ssh（如果未安装）
-            if ! command -v ssh &> /dev/null; then
-                echo "正在安装openssh-client..."
-                apk add --no-cache openssh-client
-            fi
-            
-            # 构建SSH命令
-            ssh_cmd="ssh -N -L $local_port:$dest_ip:$dest_port $ssh_server"
-            [ -n "$key_path" ] && ssh_cmd="ssh -i $key_path -N -L $local_port:$dest_ip:$dest_port $ssh_server"
-            
-            # 启动加密隧道（后台运行）
-            nohup $ssh_cmd > $CONFIG_DIR/ssh_tunnel_$local_port.log 2>&1 &
-            echo $! > $CONFIG_DIR/ssh_tunnel_$local_port.pid
-            ;;
     esac
     
     echo "规则 $rule_num 启动成功"
@@ -399,31 +309,6 @@ stop_rule() {
                 rm -f $CONFIG_DIR/socat_udp_$local_port.pid
             fi
             ;;
-            
-        nftables)
-            # 删除TCP规则
-            if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ]; then
-                nft delete rule ip nat prerouting tcp dport $local_port dnat to $dest_ip:$dest_port
-                nft delete rule ip nat postrouting ip daddr $dest_ip tcp dport $dest_port masquerade
-            fi
-            
-            # 删除UDP规则
-            if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ]; then
-                nft delete rule ip nat prerouting udp dport $local_port dnat to $dest_ip:$dest_port
-                nft delete rule ip nat postrouting ip daddr $dest_ip udp dport $dest_port masquerade
-            fi
-            
-            # 保存规则
-            nft list ruleset > /etc/nftables.conf
-            ;;
-            
-        ssh_tunnel)
-            # 停止SSH隧道
-            if [ -f "$CONFIG_DIR/ssh_tunnel_$local_port.pid" ]; then
-                kill $(cat $CONFIG_DIR/ssh_tunnel_$local_port.pid) >/dev/null 2>&1
-                rm -f $CONFIG_DIR/ssh_tunnel_$local_port.pid
-            fi
-            ;;
     esac
     
     echo "规则 $rule_num 已停止"
@@ -476,16 +361,9 @@ delete_rule() {
             continue
         fi
         
-        if [[ ! $line =~ ^[[:space:]] ]]; then
-            ((current_num++))
-            if [ $current_num -ne $rule_num ]; then
-                echo "$line" >> $tmp_file
-            fi
-        else
-            # 只保留当前规则的附加参数
-            if [ $current_num -ne $rule_num ]; then
-                echo "$line" >> $tmp_file
-            fi
+        ((current_num++))
+        if [ $current_num -ne $rule_num ]; then
+            echo "$line" >> $tmp_file
         fi
     done < $CONFIG_FILE
     
