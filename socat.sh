@@ -1,6 +1,7 @@
 #!/bin/bash
-# 简化版端口转发脚本 (仅socat)
-# 支持 TCP、UDP、TCP+UDP 转发
+# 简化版端口转发脚本
+# 仅支持 iptables 和 socat
+# 支持 TCP、UDP、TCP+UDP
 # 配置自动持久化，重启后生效
 
 # 配置文件路径
@@ -8,22 +9,23 @@ CONFIG_DIR="/etc/forwarding"
 CONFIG_FILE="$CONFIG_DIR/rules.conf"
 SERVICE_FILE="/etc/init.d/forwarding"
 
-# 确保配置目录和配置文件
+# 确保配置目录存在
 mkdir -p $CONFIG_DIR
 
 # 初始化配置文件
 if [ ! -f $CONFIG_FILE ]; then
     echo "# 转发规则配置文件" > $CONFIG_FILE
-    echo "# 格式: 协议 本地端口 目标IP 目标端口 备注" >> $CONFIG_FILE
+    echo "# 格式: 工具类型 协议 本地端口 目标IP 目标端口 备注" >> $CONFIG_FILE
+    echo "# 工具类型: iptables, socat" >> $CONFIG_FILE
     echo "# 协议: tcp, udp, tcp+udp" >> $CONFIG_FILE
 fi
 
-# 初始化服务（确保重启后自动运行）
+# 初始化服务
 init_service() {
     if [ ! -f $SERVICE_FILE ]; then
         cat << EOF > $SERVICE_FILE
 #!/sbin/openrc-run
-description="Socat port forwarding service"
+description="Port forwarding service"
 start() {
     ebegin "Starting port forwarding"
     $0 start_all
@@ -44,7 +46,7 @@ EOF
 show_menu() {
     clear
     echo "============================================="
-    echo "           Socat 端口转发管理脚本            "
+    echo "           端口转发管理脚本 (精简版)         "
     echo "============================================="
     echo "1. 添加新转发规则"
     echo "2. 查看所有转发规则"
@@ -64,8 +66,20 @@ add_rule() {
     echo "               添加新转发规则                "
     echo "============================================="
     
+    # 选择工具
+    echo "选择转发工具:"
+    echo "1. iptables (简单端口转发，性能好)"
+    echo "2. socat (灵活，支持多种转发类型)"
+    read -p "请选择 [1-2]: " tool_choice
+    
+    case $tool_choice in
+        1) tool="iptables" ;;
+        2) tool="socat" ;;
+        *) echo "无效选择"; sleep 2; return ;;
+    esac
+    
     # 选择协议
-    echo "选择协议类型:"
+    echo -e "\n选择协议类型:"
     echo "1. TCP"
     echo "2. UDP"
     echo "3. TCP+UDP"
@@ -85,7 +99,7 @@ add_rule() {
     read -p "请输入备注(可选): " comment
     
     # 保存规则到配置文件
-    echo "$proto $local_port $dest_ip $dest_port $comment" >> $CONFIG_FILE
+    echo "$tool $proto $local_port $dest_ip $dest_port $comment" >> $CONFIG_FILE
     
     echo -e "\n规则已添加，编号为: $(grep -c '^[^#]' $CONFIG_FILE)"
     read -p "是否立即启动该规则? (y/n): " start_now
@@ -100,7 +114,7 @@ show_rules() {
     echo "============================================="
     echo "               所有转发规则                  "
     echo "============================================="
-    echo "编号  协议      本地端口 -> 目标IP:目标端口  备注"
+    echo "编号  工具        协议      本地端口 -> 目标IP:目标端口  备注"
     echo "---------------------------------------------------------"
     
     rule_num=0
@@ -109,11 +123,12 @@ show_rules() {
         [[ $line =~ ^# || -z $line ]] && continue
         
         ((rule_num++))
-        proto=$(echo $line | awk '{print $1}')
-        local_port=$(echo $line | awk '{print $2}')
-        dest_ip=$(echo $line | awk '{print $3}')
-        dest_port=$(echo $line | awk '{print $4}')
-        comment=$(echo $line | awk '{$1=$2=$3=$4=""; print $0}' | xargs)
+        tool=$(echo $line | awk '{print $1}')
+        proto=$(echo $line | awk '{print $2}')
+        local_port=$(echo $line | awk '{print $3}')
+        dest_ip=$(echo $line | awk '{print $4}')
+        dest_port=$(echo $line | awk '{print $5}')
+        comment=$(echo $line | awk '{$1=$2=$3=$4=$5=""; print $0}' | xargs)
         
         # 检查规则是否正在运行
         status="停止"
@@ -121,8 +136,8 @@ show_rules() {
             status="运行中"
         fi
         
-        printf "%-5d %-9s %-5s -> %-15s:%-5s  %s (状态: %s)\n" \
-            $rule_num $proto $local_port $dest_ip $dest_port "$comment" "$status"
+        printf "%-5d %-10s %-9s %-5s -> %-15s:%-5s  %s (状态: %s)\n" \
+            $rule_num $tool $proto $local_port $dest_ip $dest_port "$comment" "$status"
     done < $CONFIG_FILE
     
     echo "============================================="
@@ -133,23 +148,24 @@ show_rules() {
 is_running() {
     rule_num=$1
     get_rule $rule_num
-    if [ -z "$proto" ]; then return 1; fi
+    if [ -z "$tool" ]; then return 1; fi
     
-    # 检查对应协议的进程是否存在
-    if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ]; then
-        if [ -f "$CONFIG_DIR/socat_tcp_$local_port.pid" ]; then
-            pgrep -F "$CONFIG_DIR/socat_tcp_$local_port.pid" >/dev/null 2>&1
+    case $tool in
+        iptables)
+            if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ]; then
+                iptables -t nat -C PREROUTING -p tcp --dport $local_port -j DNAT --to-destination $dest_ip:$dest_port >/dev/null 2>&1
+                if [ $? -eq 0 ]; then return 0; fi
+            fi
+            if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ]; then
+                iptables -t nat -C PREROUTING -p udp --dport $local_port -j DNAT --to-destination $dest_ip:$dest_port >/dev/null 2>&1
+                if [ $? -eq 0 ]; then return 0; fi
+            fi
+            ;;
+        socat)
+            pgrep -f "socat .*LISTEN:$local_port" >/dev/null 2>&1
             if [ $? -eq 0 ]; then return 0; fi
-        fi
-    fi
-    
-    if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ]; then
-        if [ -f "$CONFIG_DIR/socat_udp_$local_port.pid" ]; then
-            pgrep -F "$CONFIG_DIR/socat_udp_$local_port.pid" >/dev/null 2>&1
-            if [ $? -eq 0 ]; then return 0; fi
-        fi
-    fi
-    
+            ;;
+    esac
     return 1
 }
 
@@ -157,6 +173,7 @@ is_running() {
 get_rule() {
     rule_num=$1
     # 重置变量
+    tool=""
     proto=""
     local_port=""
     dest_ip=""
@@ -169,11 +186,12 @@ get_rule() {
         
         ((current_num++))
         if [ $current_num -eq $rule_num ]; then
-            proto=$(echo $line | awk '{print $1}')
-            local_port=$(echo $line | awk '{print $2}')
-            dest_ip=$(echo $line | awk '{print $3}')
-            dest_port=$(echo $line | awk '{print $4}')
-            comment=$(echo $line | awk '{$1=$2=$3=$4=""; print $0}' | xargs)
+            tool=$(echo $line | awk '{print $1}')
+            proto=$(echo $line | awk '{print $2}')
+            local_port=$(echo $line | awk '{print $3}')
+            dest_ip=$(echo $line | awk '{print $4}')
+            dest_port=$(echo $line | awk '{print $5}')
+            comment=$(echo $line | awk '{$1=$2=$3=$4=$5=""; print $0}' | xargs)
             break
         fi
     done < $CONFIG_FILE
@@ -184,7 +202,7 @@ start_rule() {
     rule_num=$1
     get_rule $rule_num
     
-    if [ -z "$proto" ]; then
+    if [ -z "$tool" ]; then
         echo "规则不存在"
         return 1
     fi
@@ -195,24 +213,49 @@ start_rule() {
         return 0
     fi
     
-    echo "启动规则 $rule_num: $proto $local_port -> $dest_ip:$dest_port"
+    echo "启动规则 $rule_num: $tool $proto $local_port -> $dest_ip:$dest_port"
     
-    # 安装socat（如果未安装）
-    if ! command -v socat &> /dev/null; then
-        echo "正在安装socat..."
-        apk add --no-cache socat
-    fi
-    
-    # 启动转发（后台运行）
-    if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ]; then
-        nohup socat TCP4-LISTEN:$local_port,fork,reuseaddr TCP4:$dest_ip:$dest_port > $CONFIG_DIR/socat_tcp_$local_port.log 2>&1 &
-        echo $! > $CONFIG_DIR/socat_tcp_$local_port.pid
-    fi
-    
-    if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ]; then
-        nohup socat UDP4-LISTEN:$local_port,fork,reuseaddr UDP4:$dest_ip:$dest_port > $CONFIG_DIR/socat_udp_$local_port.log 2>&1 &
-        echo $! > $CONFIG_DIR/socat_udp_$local_port.pid
-    fi
+    case $tool in
+        iptables)
+            # 启用IP转发
+            echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+            sysctl -p >/dev/null
+            
+            # 添加TCP规则
+            if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ]; then
+                iptables -t nat -A PREROUTING -p tcp --dport $local_port -j DNAT --to-destination $dest_ip:$dest_port
+                iptables -t nat -A POSTROUTING -p tcp -d $dest_ip --dport $dest_port -j MASQUERADE
+            fi
+            
+            # 添加UDP规则
+            if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ]; then
+                iptables -t nat -A PREROUTING -p udp --dport $local_port -j DNAT --to-destination $dest_ip:$dest_port
+                iptables -t nat -A POSTROUTING -p udp -d $dest_ip --dport $dest_port -j MASQUERADE
+            fi
+            
+            # 保存规则
+            iptables-save > /etc/iptables/rules.v4
+            ;;
+            
+        socat)
+            # 安装socat（如果未安装）
+            if ! command -v socat &> /dev/null; then
+                echo "正在安装socat..."
+                apk add --no-cache socat
+            fi
+            
+            # 启动转发（后台运行）
+            if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ]; then
+                nohup socat TCP4-LISTEN:$local_port,fork,reuseaddr TCP4:$dest_ip:$dest_port > $CONFIG_DIR/socat_tcp_$local_port.log 2>&1 &
+                echo $! > $CONFIG_DIR/socat_tcp_$local_port.pid
+            fi
+            
+            if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ]; then
+                nohup socat UDP4-LISTEN:$local_port,fork,reuseaddr UDP4:$dest_ip:$dest_port > $CONFIG_DIR/socat_udp_$local_port.log 2>&1 &
+                echo $! > $CONFIG_DIR/socat_udp_$local_port.pid
+            fi
+            ;;
+    esac
     
     echo "规则 $rule_num 启动成功"
 }
@@ -222,7 +265,7 @@ stop_rule() {
     rule_num=$1
     get_rule $rule_num
     
-    if [ -z "$proto" ]; then
+    if [ -z "$tool" ]; then
         echo "规则不存在"
         return 1
     fi
@@ -233,19 +276,40 @@ stop_rule() {
         return 0
     fi
     
-    echo "停止规则 $rule_num: $proto $local_port -> $dest_ip:$dest_port"
+    echo "停止规则 $rule_num: $tool $proto $local_port -> $dest_ip:$dest_port"
     
-    # 停止TCP转发
-    if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ] && [ -f "$CONFIG_DIR/socat_tcp_$local_port.pid" ]; then
-        kill $(cat $CONFIG_DIR/socat_tcp_$local_port.pid) >/dev/null 2>&1
-        rm -f $CONFIG_DIR/socat_tcp_$local_port.pid
-    fi
-    
-    # 停止UDP转发
-    if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ] && [ -f "$CONFIG_DIR/socat_udp_$local_port.pid" ]; then
-        kill $(cat $CONFIG_DIR/socat_udp_$local_port.pid) >/dev/null 2>&1
-        rm -f $CONFIG_DIR/socat_udp_$local_port.pid
-    fi
+    case $tool in
+        iptables)
+            # 删除TCP规则
+            if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ]; then
+                iptables -t nat -D PREROUTING -p tcp --dport $local_port -j DNAT --to-destination $dest_ip:$dest_port
+                iptables -t nat -D POSTROUTING -p tcp -d $dest_ip --dport $dest_port -j MASQUERADE
+            fi
+            
+            # 删除UDP规则
+            if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ]; then
+                iptables -t nat -D PREROUTING -p udp --dport $local_port -j DNAT --to-destination $dest_ip:$dest_port
+                iptables -t nat -D POSTROUTING -p udp -d $dest_ip --dport $dest_port -j MASQUERADE
+            fi
+            
+            # 保存规则
+            iptables-save > /etc/iptables/rules.v4
+            ;;
+            
+        socat)
+            # 停止TCP转发
+            if [ "$proto" = "tcp" ] || [ "$proto" = "tcp+udp" ] && [ -f "$CONFIG_DIR/socat_tcp_$local_port.pid" ]; then
+                kill $(cat $CONFIG_DIR/socat_tcp_$local_port.pid) >/dev/null 2>&1
+                rm -f $CONFIG_DIR/socat_tcp_$local_port.pid
+            fi
+            
+            # 停止UDP转发
+            if [ "$proto" = "udp" ] || [ "$proto" = "tcp+udp" ] && [ -f "$CONFIG_DIR/socat_udp_$local_port.pid" ]; then
+                kill $(cat $CONFIG_DIR/socat_udp_$local_port.pid) >/dev/null 2>&1
+                rm -f $CONFIG_DIR/socat_udp_$local_port.pid
+            fi
+            ;;
+    esac
     
     echo "规则 $rule_num 已停止"
 }
