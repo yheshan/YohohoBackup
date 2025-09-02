@@ -1,6 +1,6 @@
 #!/bin/sh
-# Alpine iptables端口转发工具（修复链创建问题）
-# 确保自定义链正确初始化，解决"No chain/target/match"错误
+# Alpine iptables端口转发工具（修复语法错误版）
+# 解决括号不匹配问题，确保脚本正常运行
 
 RULES_FILE="/etc/iptables/forward_rules.v4"
 CHAIN_NAME="PORT_FORWARD"
@@ -20,7 +20,7 @@ install_iptables() {
     fi
 }
 
-# 确保自定义链存在（核心修复）
+# 确保自定义链存在
 ensure_chain_exists() {
     # 检查链是否存在
     if ! iptables -t nat -L $CHAIN_NAME >/dev/null 2>&1; then
@@ -91,12 +91,12 @@ show_rules() {
     echo "======================="
 }
 
-# 添加规则（增加链检查链）
+# 添加规则
 add_rule() {
     # 再次确认链存在
     ensure_chain_exists
     
-    echo -e "\n===== 添加新转发发规则 ====="
+    echo -e "\n===== 添加新转发规则 ====="
     
     read -p "本地监听端口: " local_port
     if ! echo "$local_port" | grep -qE '^[0-9]+$' || [ "$local_port" -lt 1 ] || [ "$local_port" -gt 65535 ]; then
@@ -145,7 +145,7 @@ add_rule() {
     fi
 }
 
-# 删除规则
+# 删除规则（修复括号不匹配问题）
 delete_rule() {
     show_rules
     
@@ -158,7 +158,7 @@ delete_rule() {
     rule_line=$(iptables -t nat -L $CHAIN_NAME --line-numbers | grep -v "Chain\|target\|^$\|RETURN" | sed -n "${rule_num}p")
     [ -z "$rule_line" ] && { echo "编号不存在"; return 1; }
     
-    protocol=$(echo "$rule_line" | awk '{print $2}'
+    protocol=$(echo "$rule_line" | awk '{print $2}')  # 修复此处括号不匹配问题
     local_port=$(echo "$rule_line" | awk '{print $9}')
     remote_ip=$(echo "$rule_line" | awk '{print $12}' | cut -d: -f1)
     remote_port=$(echo "$rule_line" | awk '{print $12}' | cut -d: -f2)
@@ -169,14 +169,14 @@ delete_rule() {
         echo "已删除规则：$rule_line"
         save_rules
     else
-        echo "删除除规则失败"
+        echo "删除规则失败"
     fi
 }
 
 # 清除所有规则
 clear_all_rules() {
     read -p "确定清除所有规则？(y/n): " confirm
-    [ "$confirm" != "y" ] && { echo "取消取消操作"; return 0; }
+    [ "$confirm" != "y" ] && { echo "取消操作"; return 0; }  # 修复重复文字
     
     iptables -t nat -F $CHAIN_NAME
     iptables -F INPUT
@@ -203,7 +203,7 @@ stop_forward() {
 # 显示菜单
 show_menu() {
     clear
-    echo "===================== iptables端口转发发工具转发工具 ====================="
+    echo "===================== iptables端口转发工具 ====================="  # 修复重复文字
     echo "1. 添加转发规则"
     echo "2. 删除单个规则"
     echo "3. 清除所有规则"
