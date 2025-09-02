@@ -1,5 +1,5 @@
 #!/bin/bash
-# 功能：nftables 端口转发管理（全版本兼容显示 + 精准删除）
+# 功能：nftables 端口转发管理（强制显示 + 句柄删除）
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,17 +12,17 @@ check_root() {
 }
 
 install_deps() {
-    if ! command -v nft &>/dev/null; then
+    command -v nft &>/dev/null || {
         if grep -qi "alpine" /etc/os-release; then
             apk add --no-cache nftables
         else
             apt-get update || yum install -y nftables
         fi
-    fi
+    }
 }
 
 nftables_save() {
-    nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+    nft list ruleset > /etc/nftables.conf
 }
 
 forward() {
@@ -33,84 +33,63 @@ forward() {
     echo -e "\n${YELLOW}选择协议类型:${NC}"
     echo "1) TCP"
     echo "2) UDP"
-    echo "3) TCP+UDP"
-    read -p "请选择 [1-3]: " PROTOCOL_CHOICE
+    read -p "请选择 [1-2]: " PROTOCOL_CHOICE
+
+    case $PROTOCOL_CHOICE in
+        1) PROTOCOL="tcp" ;;
+        2) PROTOCOL="udp" ;;
+        *) echo -e "${RED}无效选择！${NC}" && return ;;
+    esac
 
     sysctl -w net.ipv4.ip_forward=1
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-    case $PROTOCOL_CHOICE in
-        1) PROTOCOLS=("tcp") ;;
-        2) PROTOCOLS=("udp") ;;
-        3) PROTOCOLS=("tcp" "udp") ;;
-        *) echo -e "${RED}无效选择！${NC}" && return ;;
-    esac
-
-    RULES="table ip nat {\n    chain prerouting {\n        type nat hook prerouting priority 0;"
-    for PROTOCOL in "${PROTOCOLS[@]}"; do
-        RULES+="\n        $PROTOCOL dport $LOCAL_PORT dnat to $TARGET_IP:$TARGET_PORT"
-    done
-    RULES+="\n    }\n    chain postrouting {\n        type nat hook postrouting priority 100;\n        masquerade\n    }\n}"
-
-    echo -e "$RULES" > /etc/nftables.conf
-    nft -f /etc/nftables.conf
+    nft add table ip nat
+    nft add chain ip nat prerouting { type nat hook prerouting priority 0 \; }
+    nft add chain ip nat postrouting { type nat hook postrouting priority 100 \; }
+    
+    nft add rule ip nat prerouting $PROTOCOL dport $LOCAL_PORT dnat to $TARGET_IP:$TARGET_PORT
+    nft add rule ip nat postrouting masquerade
     nftables_save
-    echo -e "${GREEN}规则已添加: ${LOCAL_PORT} -> ${TARGET_IP}:${TARGET_PORT} (${PROTOCOLS[*]})${NC}"
+
+    echo -e "${GREEN}成功: ${PROTOCOL^^} ${LOCAL_PORT} -> ${TARGET_IP}:${TARGET_PORT}${NC}"
 }
 
 show_rules() {
-    echo -e "\n${BLUE}=== 当前 nftables 规则 ===${NC}"
-    nft list table ip nat 2>/dev/null | awk '
-    BEGIN { RS=""; FS="\n" }
-    {
-        for (i=1; i<=NF; i++) {
-            if ($i ~ /tcp|udp/) {
-                split($i, proto_line, " ");
-                proto = toupper(proto_line[1]);
-                port = proto_line[3];
-            }
-            if ($i ~ /dnat/) {
-                split($i, dnat_line, " ");
-                split(dnat_line[4], target, ":");
-                ip = target[1];
-                port_dst = target[2];
-            }
-            if (proto && port && ip && port_dst) {
-                printf "  %s %s -> %s:%s\n", proto, port, ip, port_dst;
-                proto = port = ip = port_dst = "";
-            }
+    echo -e "\n${BLUE}=== 当前转发规则 ===${NC}"
+    nft list table ip nat 2>/dev/null | grep -E 'tcp|udp' -A1 | awk '{
+        if ($0 ~ /tcp|udp/) {
+            proto = toupper($1);
+            port = $3;
+        }
+        if ($0 ~ /dnat/) {
+            target = $4;
+            printf "  %-5s %-6s -> %s\n", proto, port, target
         }
     }'
 }
 
 delete_rule() {
     show_rules
-    RULE_COUNT=$(nft list table ip nat 2>/dev/null | grep -c "dnat to")
-    [ "$RULE_COUNT" -eq 0 ] && {
-        echo -e "${RED}无规则可删！${NC}"
+    read -p "输入要删除的本地端口号: " PORT
+    read -p "输入协议类型(tcp/udp): " PROTOCOL
+
+    HANDLE=$(nft -a list chain ip nat prerouting | grep "$PROTOCOL dport $PORT" -A1 | grep -oP '(?<=handle )\d+')
+    [ -z "$HANDLE" ] && {
+        echo -e "${RED}未找到匹配规则！${NC}"
         return
     }
-    read -p "输入要删除的规则行号: " NUM
-    [ "$NUM" -gt "$RULE_COUNT" ] && {
-        echo -e "${RED}无效行号！当前共有 $RULE_COUNT 条规则${NC}"
-        return
-    }
-    
-    # 获取精准删除参数
-    TARGET_RULE=$(nft list table ip nat 2>/dev/null | grep -A1 "tcp\|udp" | grep -A1 "dnat" | sed -n "$((NUM*2-1)),$((NUM*2))p")
-    PROTO=$(echo "$TARGET_RULE" | grep -oP 'tcp|udp' | head -1 | tr 'a-z' 'A-Z')
-    PORT=$(echo "$TARGET_RULE" | grep -oP '(?<=dport )\d+')
-    TARGET=$(echo "$TARGET_RULE" | grep -oP '(?<=to )[\d.:]+')
-    
-    nft delete rule ip nat prerouting handle $(nft -a list chain ip nat prerouting | grep -A1 "$PROTO.*dport $PORT" | grep -oP '(?<=handle )\d+')
+
+    nft delete rule ip nat prerouting handle $HANDLE
     nftables_save
     echo -e "${GREEN}规则已删除！${NC}"
 }
 
 flush_rules() {
-    echo -e "\n${RED}=== 警告：即将清空所有 nftables 规则 ===${NC}"
+    echo -e "\n${RED}=== 警告：将清空所有规则 ===${NC}"
     read -p "确认操作？(y/n): " CONFIRM
     [ "$CONFIRM" != "y" ] && return
+    
     nft flush ruleset
     rm -f /etc/nftables.conf
     echo -e "${GREEN}所有规则已清空！${NC}"
@@ -120,18 +99,18 @@ main_menu() {
     echo -e "\n${YELLOW}==== nftables 转发管理 ====${NC}"
     echo "1) 添加转发规则"
     echo "2) 查看规则"
-    echo "3) 删除单条规则"
+    echo "3) 删除规则"
     echo "4) 清空所有规则"
-    echo -e "${RED}q) 退出${NC}"
-    read -p "请选择操作 [1-4/q]: " CHOICE
+    echo -e "${RED}0) 退出${NC}"
+    read -p "请选择: " CHOICE
 
     case $CHOICE in
         1) forward ;;
         2) show_rules ;;
         3) delete_rule ;;
         4) flush_rules ;;
-        q) exit 0 ;;
-        *) echo -e "${RED}无效操作！${NC}" ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选择！${NC}" ;;
     esac
 }
 
